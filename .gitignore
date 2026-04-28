@@ -1,0 +1,27 @@
+# Binaries
+*.db
+go-app2/app
+go-app2/go-app2
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Environment
+.env
+nohup.out
+
+# Temp/debug
+debug/
+/tmp/
+*.dat
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
