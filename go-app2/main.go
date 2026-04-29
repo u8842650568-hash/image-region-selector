@@ -106,18 +106,6 @@ func dbReorder(items []ImageItem) {
 
 // ==================== Handlers ====================
 
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-	resp, err := http.Get(ocrURL + "/health")
-	if err != nil {
-		jsonOK(w, map[string]interface{}{"model_loaded": false})
-		return
-	}
-	defer resp.Body.Close()
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	jsonOK(w, result)
-}
-
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(htmlPage))
@@ -391,10 +379,6 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 .btn-icon{width:32px;height:32px;border:1px solid #d9d9d9;border-radius:6px;cursor:pointer;font-size:16px;display:inline-flex;align-items:center;justify-content:center;background:#fff;transition:all .15s;padding:0}
 .btn-icon:hover{border-color:#4096ff;color:#4096ff}
 .toolbar-right{margin-left:auto;display:flex;align-items:center;gap:8px}
-.ocr-status{font-size:12px;padding:3px 10px;border-radius:10px}
-.ocr-status.ok{background:#f6ffed;color:#52c41a;border:1px solid #b7eb8f}
-.ocr-status.off{background:#fff2f0;color:#ff4d4f;border:1px solid #ffccc7}
-.ocr-status.loading{background:#fff7e6;color:#fa8c16;border:1px solid #ffd591}
 
 /* Main layout */
 .main{display:flex;flex:1;overflow:hidden}
@@ -405,11 +389,17 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 .sidebar-list{flex:1;overflow-y:auto;padding:8px}
 .sidebar-list::-webkit-scrollbar{width:4px}
 .sidebar-list::-webkit-scrollbar-thumb{background:#ddd;border-radius:2px}
-.img-card{position:relative;margin-bottom:8px;border:2px solid transparent;border-radius:8px;cursor:grab;transition:all .15s;background:#fafafa}
+.img-card{position:relative;margin-bottom:8px;border:2px solid transparent;border-radius:8px;transition:transform .3s cubic-bezier(.22,1,.36,1), border-color .15s, box-shadow .15s, background .15s;background:#fafafa;will-change:transform;display:flex;align-items:stretch}
 .img-card:hover{border-color:#4096ff;box-shadow:0 2px 8px rgba(0,0,0,.08)}
 .img-card.active{border-color:#4096ff;background:#e6f4ff}
-.img-card.drag-over{border-color:#1677ff;background:#bae0ff}
-.img-card .thumb{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:6px;display:block;background:#f0f0f0;position:relative}
+.img-card.dragging{box-shadow:0 12px 32px rgba(0,0,0,.22);z-index:100;border-color:#1677ff;background:#fff;transition:none;transform-origin:center center}
+.img-card.dragging .thumb-wrap{display:none}
+.drag-handle{width:20px;min-height:100%;display:flex;align-items:center;justify-content:center;cursor:grab;background:#f0f0f0;border-radius:6px 0 0 6px;flex-shrink:0;touch-action:none;transition:background .15s}
+.drag-handle:hover{background:#e4e4e4}
+.drag-handle:active{cursor:grabbing}
+.card-body{flex:1;min-width:0;position:relative}
+.drop-preview{position:absolute;left:4px;right:4px;height:0;border:2px solid #1677ff;border-radius:6px;box-shadow:0 0 8px rgba(22,119,255,.3);z-index:50;pointer-events:none;opacity:0;transition:top .2s cubic-bezier(.22,1,.36,1), opacity .15s}
+.img-card .thumb{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:6px;display:block;background:#f0f0f0}
 .img-card .order-badge{position:absolute;top:4px;left:4px;min-width:20px;height:20px;border-radius:10px;background:rgba(0,0,0,.55);color:#fff;font-size:11px;font-weight:bold;text-align:center;line-height:20px;padding:0 5px;pointer-events:none}
 .img-card .info{padding:6px 8px;font-size:12px;color:#666;display:flex;justify-content:space-between;align-items:center}
 .img-card .info .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px}
@@ -483,14 +473,12 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 <div class="toolbar">
   <h1>多图文本识别</h1>
   <div class="mode-toggle" id="modeToggle">
-    <span class="mode-opt active" data-mode="local" onclick="setMode('local')">本地识别</span>
-    <span class="mode-opt" data-mode="ai" onclick="setMode('ai')">AI识别</span>
+    <span class="mode-opt active" data-mode="ai" onclick="setMode('ai')">AI识别</span>
   </div>
   <button class="btn" onclick="exportText()">导出文本</button>
   <button class="btn btn-danger" onclick="clearAll()">清空</button>
   <input type="file" id="fileInput" accept="image/*" multiple style="display:none" onchange="handleFiles(event)">
   <div class="toolbar-right">
-    <span class="ocr-status" id="ocrStatus">检查中...</span>
     <button class="btn-icon" onclick="openConfigModal()" title="AI识别配置">&#9881;</button>
   </div>
 </div>
@@ -574,7 +562,7 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 let imgItems = [];
 let activeImgId = null;
 let ocrRunning = false;
-let ocrMode = localStorage.getItem('ocrMode') || 'local';
+let ocrMode = 'ai';
 
 // Region modal state
 let regionImgId = null;
@@ -611,22 +599,6 @@ async function api(path, opts={}) {
       render();
     }
   } catch(e) {}
-  // Check OCR service via backend proxy (avoid CORS)
-  try {
-    const d = await api('/api/health');
-    const el = document.getElementById('ocrStatus');
-    if (d.model_loaded) {
-      el.textContent = 'OCR 就绪';
-      el.className = 'ocr-status ok';
-    } else {
-      el.textContent = 'OCR 加载中...';
-      el.className = 'ocr-status loading';
-    }
-  } catch(e) {
-    const el = document.getElementById('ocrStatus');
-    el.textContent = 'OCR 未启动';
-    el.className = 'ocr-status off';
-  }
 })();
 
 // ========== Upload ==========
@@ -703,10 +675,12 @@ function renderSidebar() {
     const cls = item.id === activeImgId ? 'img-card active' : 'img-card';
     const dotCls = item.status || 'ready';
     const shortName = item.name.length > 15 ? item.name.substring(0,12)+'...' : item.name;
-    html += '<div class="'+cls+'" draggable="true" data-id="'+item.id+'" data-idx="'+idx+'"'
-      + ' ondragstart="onDragStart(event)" ondragover="onDragOver(event)" ondrop="onDrop(event)" ondragend="onDragEnd(event)"'
+    html += '<div class="'+cls+'" data-id="'+item.id+'" data-idx="'+idx+'"'
       + ' onclick="selectImage('+item.id+')">'
-      + '<div style="position:relative"><img class="thumb" src="'+item.data+'" alt="'+item.name+'">'
+      + '<div class="drag-handle" onpointerdown="onPointerDown(event)">'
+      + '<svg viewBox="0 0 10 20" width="10" height="20"><circle cx="3" cy="4" r="1.5" fill="#bbb"/><circle cx="3" cy="10" r="1.5" fill="#bbb"/><circle cx="3" cy="16" r="1.5" fill="#bbb"/><circle cx="7" cy="4" r="1.5" fill="#bbb"/><circle cx="7" cy="10" r="1.5" fill="#bbb"/><circle cx="7" cy="16" r="1.5" fill="#bbb"/></svg>'
+      + '</div>'
+      + '<div class="card-body"><div class="thumb-wrap" style="position:relative"><img class="thumb" src="'+item.data+'" alt="'+item.name+'">'
       + '<span class="order-badge">'+(idx+1)+'</span></div>'
       + '<div class="info"><span class="name">'+shortName+'</span>'
       + '<span class="status-dot '+dotCls+'"></span></div>'
@@ -715,7 +689,7 @@ function renderSidebar() {
         ? '<button class="ocr-btn" style="bottom:64px;background:rgba(255,0,0,.7)" onclick="event.stopPropagation();stopOCR('+item.id+')">停止</button>'
         : '<button class="ocr-btn" style="bottom:64px" onclick="event.stopPropagation();reOCR('+item.id+')">重新识别</button>')
       + '<button class="ocr-btn" onclick="event.stopPropagation();openRegionModal('+item.id+')">框选识别</button>'
-      + '</div>';
+      + '</div></div>';
   });
   html += '<div class="add-card" onclick="addImages()">+ 添加图片</div>';
   list.innerHTML = html;
@@ -879,39 +853,215 @@ function saveText(id, text) {
   }, 800);
 }
 
-// ========== Drag & Drop Reorder ==========
-let dragSrcId = null;
-function onDragStart(e) {
-  dragSrcId = parseInt(e.currentTarget.dataset.id);
-  e.currentTarget.style.opacity = '0.4';
-  e.dataTransfer.effectAllowed = 'move';
+// ========== CapCut-style Pointer Drag Reorder ==========
+const _drag = {active:false, id:null, el:null, startY:0, origIdx:0, targetIdx:-1, moved:false, cardH:0};
+let _dropPreview = null;
+
+function _getDropPreview() {
+  if (!_dropPreview) {
+    _dropPreview = document.createElement('div');
+    _dropPreview.className = 'drop-preview';
+    document.getElementById('sidebarList').appendChild(_dropPreview);
+  }
+  return _dropPreview;
 }
-function onDragOver(e) {
-  e.preventDefault();
-  e.dataTransfer.dropEffect = 'move';
-  e.currentTarget.classList.add('drag-over');
+
+function onPointerDown(e) {
+  if (e.button !== 0 || _drag.active) return;
+  const card = e.currentTarget.closest('.img-card');
+  if (!card) return;
+  _drag.id = parseInt(card.dataset.id);
+  _drag.el = card;
+  _drag.origIdx = _drag.targetIdx = parseInt(card.dataset.idx);
+  _drag.startY = e.clientY;
+  _drag.moved = false;
+  card.setPointerCapture(e.pointerId);
+  card.addEventListener('pointermove', onPointerMove);
+  card.addEventListener('pointerup', onPointerUp);
+  card.addEventListener('pointercancel', onPointerUp);
 }
-function onDrop(e) {
-  e.preventDefault();
-  e.currentTarget.classList.remove('drag-over');
-  const targetId = parseInt(e.currentTarget.dataset.id);
-  if (dragSrcId === targetId) return;
-  const srcIdx = imgItems.findIndex(i => i.id === dragSrcId);
-  const tgtIdx = imgItems.findIndex(i => i.id === targetId);
-  if (srcIdx < 0 || tgtIdx < 0) return;
-  const [moved] = imgItems.splice(srcIdx, 1);
-  imgItems.splice(tgtIdx, 0, moved);
-  // Persist order
-  api('/api/reorder', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ids: imgItems.map(i => i.id)})
+
+function onPointerMove(e) {
+  if (!_drag.active) {
+    if (Math.abs(e.clientY - _drag.startY) < 5) return;
+    _drag.active = true;
+    _drag.moved = true;
+    _drag.el.classList.add('dragging');
+    _drag.cardH = _drag.el.getBoundingClientRect().height + 8;
+  }
+
+  // Move dragged card vertically
+  _drag.el.style.transform = 'translateY(' + (e.clientY - _drag.startY) + 'px)';
+
+  // Calculate target index: count how many non-dragged cards the pointer has passed
+  const list = document.getElementById('sidebarList');
+  const cards = list.querySelectorAll('.img-card');
+  let newTarget = 0;
+  for (const c of cards) {
+    if (parseInt(c.dataset.id) === _drag.id) continue;
+    const rect = c.getBoundingClientRect();
+    if (e.clientY >= rect.top + rect.height / 2) {
+      newTarget++;
+    } else {
+      break;
+    }
+  }
+
+  if (newTarget !== _drag.targetIdx) {
+    _drag.targetIdx = newTarget;
+    _applyShifts();
+    _showPreview(newTarget);
+  }
+}
+
+function _applyShifts() {
+  const list = document.getElementById('sidebarList');
+  const cards = list.querySelectorAll('.img-card');
+  const h = _drag.cardH;
+  const from = _drag.origIdx;
+  const to = _drag.targetIdx;
+
+  cards.forEach(card => {
+    const idx = parseInt(card.dataset.idx);
+    if (idx === _drag.origIdx) return;
+    let shift = 0;
+    if (from < to) {
+      if (idx > from && idx <= to) shift = -h;
+    } else if (from > to) {
+      if (idx >= to && idx < from) shift = h;
+    }
+    card.style.transform = shift ? 'translateY(' + shift + 'px)' : '';
   });
-  render();
 }
-function onDragEnd(e) {
-  e.currentTarget.style.opacity = '1';
-  document.querySelectorAll('.img-card').forEach(c => c.classList.remove('drag-over'));
+
+function _showPreview(targetIdx) {
+  const list = document.getElementById('sidebarList');
+  const cards = list.querySelectorAll('.img-card:not(.dragging)');
+  const preview = _getDropPreview();
+  const listRect = list.getBoundingClientRect();
+
+  if (targetIdx === _drag.origIdx) {
+    preview.style.opacity = '0';
+    return;
+  }
+
+  // Position the preview box at the gap between cards
+  let gapTop, gapBottom;
+  if (targetIdx >= cards.length) {
+    const lastCard = cards[cards.length - 1];
+    if (!lastCard) { preview.style.opacity = '0'; return; }
+    const r = lastCard.getBoundingClientRect();
+    gapTop = r.bottom - listRect.top + list.scrollTop;
+    gapBottom = gapTop + 8;
+  } else if (targetIdx === 0) {
+    const firstCard = cards[0];
+    if (!firstCard) { preview.style.opacity = '0'; return; }
+    const r = firstCard.getBoundingClientRect();
+    gapBottom = r.top - listRect.top + list.scrollTop;
+    gapTop = gapBottom - 8;
+  } else {
+    const above = cards[targetIdx - 1];
+    const below = cards[targetIdx];
+    if (!above || !below) { preview.style.opacity = '0'; return; }
+    const rAbove = above.getBoundingClientRect();
+    const rBelow = below.getBoundingClientRect();
+    gapTop = rAbove.bottom - listRect.top + list.scrollTop;
+    gapBottom = rBelow.top - listRect.top + list.scrollTop;
+  }
+
+  preview.style.top = gapTop + 'px';
+  preview.style.height = Math.max(gapBottom - gapTop, 4) + 'px';
+  preview.style.opacity = '1';
+}
+
+function onPointerUp(e) {
+  const card = _drag.el;
+  card.removeEventListener('pointermove', onPointerMove);
+  card.removeEventListener('pointerup', onPointerUp);
+  card.removeEventListener('pointercancel', onPointerUp);
+
+  if (!_drag.active) {
+    _drag.active = false;
+    _drag.moved = false;
+    return;
+  }
+
+  // Hide preview
+  _getDropPreview().style.opacity = '0';
+
+  const from = _drag.origIdx;
+  const to = _drag.targetIdx;
+
+  if (to !== from) {
+    // Commit reorder
+    const [moved] = imgItems.splice(from, 1);
+    imgItems.splice(to, 0, moved);
+    api('/api/reorder', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids: imgItems.map(i => i.id)})
+    });
+
+    // FLIP: snapshot current visual positions (including shifted transforms)
+    const list = document.getElementById('sidebarList');
+    const cards = list.querySelectorAll('.img-card');
+    const snapshots = [];
+    cards.forEach(c => snapshots.push({id:parseInt(c.dataset.id), top:c.getBoundingClientRect().top}));
+
+    // Re-render with new order
+    render();
+
+    // Invert: lock cards at their old visual positions
+    const newCards = list.querySelectorAll('.img-card');
+    for (const nc of newCards) {
+      const id = parseInt(nc.dataset.id);
+      const snap = snapshots.find(s => s.id === id);
+      if (!snap) continue;
+      const newTop = nc.getBoundingClientRect().top;
+      const dy = snap.top - newTop;
+      if (Math.abs(dy) < 1) continue;
+      nc.style.transition = 'none';
+      nc.style.transform = 'translateY(' + dy + 'px)';
+    }
+
+    // Play: animate to final positions
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        newCards.forEach(c => {
+          if (!c.style.transform) return;
+          c.style.transition = 'transform .3s cubic-bezier(.22,1,.36,1)';
+          c.style.transform = '';
+          c.addEventListener('transitionend', function h() {
+            c.removeEventListener('transitionend', h);
+            c.style.transition = '';
+            c.style.transform = '';
+          }, {once:true});
+        });
+      });
+    });
+  } else {
+    // No reorder — animate back to origin
+    // Clear all other cards' transforms first
+    document.querySelectorAll('.img-card').forEach(c => {
+      if (parseInt(c.dataset.id) !== _drag.id) { c.style.transform = ''; c.style.transition = ''; }
+    });
+    card.classList.remove('dragging');
+    card.style.transition = 'transform .25s cubic-bezier(.22,1,.36,1)';
+    card.style.transform = '';
+    card.addEventListener('transitionend', function h() {
+      card.removeEventListener('transitionend', h);
+      card.style.transition = '';
+    }, {once:true});
+    setTimeout(() => { card.style.transition = ''; }, 300);
+  }
+
+  // Prevent click after drag
+  if (_drag.moved) {
+    card.addEventListener('click', function prevent(ev) { ev.stopPropagation(); card.removeEventListener('click', prevent); }, {once:true});
+  }
+
+  _drag.active = false;
+  _drag.moved = false;
 }
 
 // ========== Recognize All ==========
@@ -1225,11 +1375,11 @@ let aiConfig = {
 };
 
 const presets = [
-  {name:'glm-4v-flash', label:'GLM-4V Flash (免费)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
-  {name:'glm-4v-plus',  label:'GLM-4V Plus (付费)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
-  {name:'qwen-vl-max',  label:'Qwen-VL Max (通义千问)', url:'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'},
-  {name:'qwen-vl-plus', label:'Qwen-VL Plus (通义千问)', url:'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'},
-  {name:'gpt-4o',        label:'GPT-4o (OpenAI)', url:'https://api.openai.com/v1/chat/completions'},
+  {name:'glm-4v-flash',   label:'GLM-4V Flash (免费)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
+  {name:'glm-4v-plus',    label:'GLM-4V Plus (付费)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
+  {name:'qwen-vl-max',    label:'Qwen-VL Max (通义千问)', url:'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'},
+  {name:'qwen-vl-plus',   label:'Qwen-VL Plus (通义千问)', url:'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'},
+  {name:'gpt-4o',         label:'GPT-4o (OpenAI)', url:'https://api.openai.com/v1/chat/completions'},
 ];
 
 function openConfigModal() {
@@ -1290,7 +1440,6 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/upload", handleUpload)
 	http.HandleFunc("/api/images", handleListImages)
-	http.HandleFunc("/api/health", handleHealth)
 	http.HandleFunc("/api/reorder", handleReorder)
 	http.HandleFunc("/api/images/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
