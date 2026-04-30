@@ -803,7 +803,7 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
     <div class="config-form">
       <label>API 地址</label>
       <input type="text" id="cfgUrl" placeholder="https://open.bigmodel.cn/api/paas/v4/chat/completions">
-      <div class="hint">兼容 OpenAI Chat Completions 格式的 API 端点</div>
+      <div class="hint">AI 识别 API 地址（MiniMax VLM 仅需填写 API Host）</div>
 
       <label>模型名称</label>
       <input type="text" id="cfgModel" placeholder="glm-4v-flash">
@@ -1825,6 +1825,7 @@ const presets = [
   {name:'qwen-vl-max',    label:'Qwen-VL Max (通义千问)', url:'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'},
   {name:'qwen-vl-plus',   label:'Qwen-VL Plus (通义千问)', url:'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'},
   {name:'gpt-4o',         label:'GPT-4o (OpenAI)', url:'https://api.openai.com/v1/chat/completions'},
+  {name:'minimax-vlm',    label:'MiniMax VLM (Token Plan)', url:'https://api.minimaxi.com'},
 ];
 
 function openConfigModal() {
