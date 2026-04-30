@@ -88,7 +88,73 @@ def ai_review(ocr_text):
         return ocr_text
 
 
-def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None):
+def ai_structure_table(ocr_text):
+    """Call Claude to convert raw OCR text into structured merged table."""
+    base_url = os.environ.get("VISION_API_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
+    req_body = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 8192,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": f"""以下是OCR从一张单据图片中转录出的原始文字（可能格式混乱）。请将其整理为一个结构化的Markdown表格。
+
+重要提示：
+- OCR原文可能将相邻两条记录横向拼在同一行（如 | 编号A | 编号B |），你需要将它们拆分为独立的行
+- 每个编号对应一条独立记录，请确保每条记录独占一行
+- 不要遗漏任何一条记录，即使数据看起来重复也要保留
+
+规则：
+1. 找出所有散落的元信息（如编号、单位、日期、车号、制表人等），提取为表头的独立列，放在表格前面
+2. 表头第一列固定为"序号"，后面依次放元信息字段名，最后放实际数据的列名
+3. 元信息的值写在第一行对应列中，后续数据行这些列留空
+4. 所有记录合并为一个表格，数据行按编号顺序排列，序号递增
+5. 每一列的内容只放该列对应的信息
+6. 只输出一个完整的Markdown表格，不要输出多个表格
+7. 不要输出任何描述、解释或总结
+8. 严格忠实于原文数据，不要编造或猜测数据
+9. 统计原文中出现了多少个不同的编号，确保输出的数据行数量与编号数量完全一致
+
+示例输出格式：
+| 序号 | 编号 | 单位 | 日期 | 品名 | 毛重 | 皮重 | 净重 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0001 | XX公司 | 2026-04-30 | 粉条 | 55.34 | 25.33 | 24.74 |
+| 2 | 0002 | XX公司 | 2026-04-30 | 豆腐 | 55.32 | 10.76 | 44.56 |
+
+---OCR转录原文---
+{ocr_text}
+
+---结构化表格---
+"""
+        }]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        base_url + "/v1/messages",
+        data=req_body,
+        headers=_api_headers(),
+        method="POST",
+    )
+    opener = _build_opener()
+
+    try:
+        print("[Structure] Calling Claude...", file=sys.stderr, flush=True)
+        with opener.open(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            content = data.get("content", [])
+            if content and isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if text.strip():
+                            print(f"[Structure] Done ({len(text)} chars)", file=sys.stderr, flush=True)
+                            return text
+    except Exception as e:
+        print(f"[Structure] Failed: {e}", file=sys.stderr, flush=True)
+    return None
+
+
+def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, mode="text"):
     """Use vision model for OCR, with auto-split for long images."""
     if not api_key:
         api_key = os.environ.get("VISION_API_KEY", "")
@@ -103,8 +169,10 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None):
         nparr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
+            print("[Vision-GLM] cv2.imdecode returned None", file=sys.stderr, flush=True)
             return None
         h, w = img.shape[:2]
+        print(f"[Vision-GLM] Decoded: {w}x{h}", file=sys.stderr, flush=True)
         max_dim = 2000
         if max(h, w) > max_dim:
             scale = max_dim / max(h, w)
@@ -141,16 +209,51 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None):
             print(f"[Vision-GLM] Encode failed: {e}", file=sys.stderr)
             continue
 
+        if mode == "table" or mode == "table_raw":
+            if mode == "table_raw":
+                # Stage 1: raw table extraction, per-section, no merging
+                prompt_text = (
+                    "请识别图片中的表格内容，严格按照Markdown表格格式输出。规则：\n"
+                    "1. 每个独立表格原样输出，保持表头和数据行\n"
+                    "2. 表格中的非表格文字（如编号、单位、日期等）也作为数据行输出\n"
+                    "3. 第一行是表头，用|分隔每列\n"
+                    "4. 第二行是分隔行，如|---|---|---|\n"
+                    "5. 每一列的内容只放该列对应的信息\n"
+                    "6. 不要输出任何描述、解释或总结\n"
+                    "7. 如果有多个表格，用空行分隔"
+                )
+            else:
+                # Direct table mode (fallback, no two-stage)
+                prompt_text = (
+                    "请识别图片中的表格，严格按照Markdown表格格式输出。规则：\n"
+                    "1. 第一行必须是表头，用|分隔每列\n"
+                    "2. 第二行必须是分隔行，如|---|---|---|\n"
+                    "3. 从第三行开始是数据行，每行的列数必须与表头完全一致\n"
+                    "4. 每一列的内容只放该列对应的信息，不要将多列合并到一个单元格\n"
+                    "5. 保持与原图一致的行列结构，多个表格用空行分隔\n"
+                    "6. 不要输出任何描述、解释或总结"
+                )
+            max_tokens = 1024
+        else:
+            prompt_text = (
+                "请逐字逐句识别并转录图片中的所有文字。要求：\n"
+                "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
+                "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
+                "3. 保持原始排版格式和换行\n"
+                "4. 无法确定的字符用[?]标记"
+            )
+            max_tokens = 1024
+
         payload = {
             "model": model,
             "messages": [{
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text", "text": "请逐字逐句识别并转录图片中的所有文字。要求：\n1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n2. 不要输出类似\"这是一张...\"、\"以下是...\"、\"请注意...\"等任何非原文内容\n3. 保持原始排版格式和换行\n4. 无法确定的字符用[?]标记"}
+                    {"type": "text", "text": prompt_text}
                 ]
             }],
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "temperature": 0
         }
 
@@ -241,11 +344,31 @@ class OCRHandler(BaseHTTPRequestHandler):
             # AI mode
             ai_config = data.get("ai_config", {})
             model = ai_config.get("model", "glm-4v-flash")
-            print(f"[Vision] AI mode, model={model}, image size: {len(img_bytes)} bytes", file=sys.stderr, flush=True)
-            text = vision_ocr_glm(img_bytes,
-                model=model,
-                api_key=ai_config.get("api_key") or None,
-                api_url=ai_config.get("api_url") or None)
+            ocr_mode = data.get("recog_type", "text")
+            print(f"[Vision] AI mode, model={model}, recog_type={ocr_mode}, image size: {len(img_bytes)} bytes", file=sys.stderr, flush=True)
+
+            if ocr_mode == "table":
+                # Stage 1: vision model outputs raw tables (one per section, no merging)
+                raw_text = vision_ocr_glm(img_bytes,
+                    model=model,
+                    api_key=ai_config.get("api_key") or None,
+                    api_url=ai_config.get("api_url") or None,
+                    mode="table_raw")
+                if not raw_text:
+                    text = None
+                else:
+                    print(f"[Vision] Stage 1 OCR done ({len(raw_text)} chars), structuring...", file=sys.stderr, flush=True)
+                    # Stage 2: Claude structures raw text into table
+                    text = ai_structure_table(raw_text)
+                    if text is None:
+                        text = raw_text  # fallback to raw OCR
+                        print("[Vision] Structure failed, using raw OCR", file=sys.stderr, flush=True)
+            else:
+                text = vision_ocr_glm(img_bytes,
+                    model=model,
+                    api_key=ai_config.get("api_key") or None,
+                    api_url=ai_config.get("api_url") or None,
+                    mode=ocr_mode)
             if text:
                 self.send_json({"text": text, "status": "done", "strategy": model})
             else:

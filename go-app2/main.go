@@ -9,11 +9,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/xuri/excelize/v2"
 )
 
 const ocrURL = "http://127.0.0.1:8081"
@@ -21,13 +23,16 @@ const ocrURL = "http://127.0.0.1:8081"
 // ==================== Data Model ====================
 
 type ImageItem struct {
-	ID       int    `json:"id"`
-	Name     string `json:"name"`
-	Data     string `json:"data"`      // base64 data URL
-	Thumb    string `json:"thumb"`     // small thumbnail base64
-	Text     string `json:"text"`
-	Status   string `json:"status"`    // "ready" | "recognizing" | "done" | "error"
-	Order    int    `json:"order"`
+	ID         int    `json:"id"`
+	Name       string `json:"name"`
+	Data       string `json:"data"`       // base64 data URL
+	Thumb      string `json:"thumb"`      // small thumbnail base64
+	Text       string `json:"text"`       // text recognition result
+	TableText  string `json:"table_text"` // table recognition result
+	Status     string `json:"status"`     // text recognition status
+	TableStatus string `json:"table_status"` // table recognition status
+	RecogType  string `json:"recog_type"` // "text" or "table"
+	Order      int    `json:"order"`
 }
 
 var (
@@ -51,13 +56,19 @@ func initDB() {
 		data TEXT NOT NULL,
 		text TEXT DEFAULT '',
 		status TEXT DEFAULT 'ready',
+		table_text TEXT DEFAULT '',
+		table_status TEXT DEFAULT 'ready',
+		recog_type TEXT DEFAULT 'text',
 		sort_order INTEGER DEFAULT 0
 	)`)
+	db.Exec("ALTER TABLE images ADD COLUMN table_text TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE images ADD COLUMN table_status TEXT DEFAULT 'ready'")
+	db.Exec("ALTER TABLE images ADD COLUMN recog_type TEXT DEFAULT 'text'")
 	loadFromDB()
 }
 
 func loadFromDB() {
-	rows, err := db.Query("SELECT id, name, data, text, status, sort_order FROM images ORDER BY sort_order")
+	rows, err := db.Query("SELECT id, name, data, text, table_text, status, table_status, recog_type, sort_order FROM images ORDER BY sort_order")
 	if err != nil {
 		log.Println("DB load:", err)
 		return
@@ -67,7 +78,7 @@ func loadFromDB() {
 	maxID := 0
 	for rows.Next() {
 		var item ImageItem
-		rows.Scan(&item.ID, &item.Name, &item.Data, &item.Text, &item.Status, &item.Order)
+		rows.Scan(&item.ID, &item.Name, &item.Data, &item.Text, &item.TableText, &item.Status, &item.TableStatus, &item.RecogType, &item.Order)
 		item.Thumb = item.Data
 		images = append(images, item)
 		if item.ID > maxID {
@@ -79,8 +90,8 @@ func loadFromDB() {
 }
 
 func dbInsert(item ImageItem) {
-	db.Exec("INSERT INTO images (name, data, text, status, sort_order) VALUES (?, ?, ?, ?, ?)",
-		item.Name, item.Data, item.Text, item.Status, item.Order)
+	db.Exec("INSERT INTO images (name, data, text, status, sort_order, recog_type) VALUES (?, ?, ?, ?, ?, ?)",
+		item.Name, item.Data, item.Text, item.Status, item.Order, item.RecogType)
 	var id int
 	db.QueryRow("SELECT last_insert_rowid()").Scan(&id)
 	item.ID = id
@@ -89,9 +100,15 @@ func dbInsert(item ImageItem) {
 func dbUpdateText(id int, text string) {
 	db.Exec("UPDATE images SET text = ? WHERE id = ?", text, id)
 }
+func dbUpdateTableText(id int, text string) {
+	db.Exec("UPDATE images SET table_text = ? WHERE id = ?", text, id)
+}
 
 func dbUpdateStatus(id int, status string) {
 	db.Exec("UPDATE images SET status = ? WHERE id = ?", status, id)
+}
+func dbUpdateTableStatus(id int, status string) {
+	db.Exec("UPDATE images SET table_status = ? WHERE id = ?", status, id)
 }
 
 func dbDelete(id int) {
@@ -131,13 +148,18 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	nextID++
+	recogType := r.FormValue("recog_type")
+	if recogType == "" {
+		recogType = "text"
+	}
 	item := ImageItem{
-		ID:     nextID,
-		Name:   header.Filename,
-		Data:   dataURL,
-		Thumb:  dataURL,
-		Status: "ready",
-		Order:  len(images),
+		ID:        nextID,
+		Name:      header.Filename,
+		Data:      dataURL,
+		Thumb:     dataURL,
+		Status:    "ready",
+		RecogType: recogType,
+		Order:     len(images),
 	}
 	images = append(images, item)
 	dbInsert(item)
@@ -156,7 +178,18 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 func handleListImages(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
-	jsonOK(w, images)
+	filter := r.URL.Query().Get("type")
+	if filter != "" {
+		filtered := []ImageItem{}
+		for _, img := range images {
+			if img.RecogType == filter {
+				filtered = append(filtered, img)
+			}
+		}
+		jsonOK(w, filtered)
+	} else {
+		jsonOK(w, images)
+	}
 }
 
 func handleReorder(w http.ResponseWriter, r *http.Request) {
@@ -227,8 +260,9 @@ func handleOCR(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ImageBase64 string `json:"image_base64"`
+		ImageBase64 string                 `json:"image_base64"`
 		Mode        string                 `json:"mode"`
+		RecogType   string                 `json:"recog_type"`
 		AIConfig    map[string]interface{} `json:"ai_config"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -236,19 +270,31 @@ func handleOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	isTable := req.RecogType == "table"
 	mu.Lock()
 	for i := range images {
 		if images[i].ID == id {
-			images[i].Status = "recognizing"
+			if isTable {
+				images[i].TableStatus = "recognizing"
+			} else {
+				images[i].Status = "recognizing"
+			}
 		}
 	}
 	mu.Unlock()
-	dbUpdateStatus(id, "recognizing")
+	if isTable {
+		dbUpdateTableStatus(id, "recognizing")
+	} else {
+		dbUpdateStatus(id, "recognizing")
+	}
 
 	// Call OCR service
 	ocrReq := map[string]interface{}{"image_base64": req.ImageBase64}
 	if req.Mode != "" {
 		ocrReq["mode"] = req.Mode
+	}
+	if req.RecogType != "" {
+		ocrReq["recog_type"] = req.RecogType
 	}
 	if req.AIConfig != nil {
 		ocrReq["ai_config"] = req.AIConfig
@@ -260,11 +306,19 @@ func handleOCR(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		for i := range images {
 			if images[i].ID == id {
-				images[i].Status = "error"
+				if isTable {
+					images[i].TableStatus = "error"
+				} else {
+					images[i].Status = "error"
+				}
 			}
 		}
 		mu.Unlock()
-		dbUpdateStatus(id, "error")
+		if isTable {
+			dbUpdateTableStatus(id, "error")
+		} else {
+			dbUpdateStatus(id, "error")
+		}
 		jsonErr(w, "OCR服务不可用: "+err.Error())
 		return
 	}
@@ -280,13 +334,23 @@ func handleOCR(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	for i := range images {
 		if images[i].ID == id {
-			images[i].Text = text
-			images[i].Status = "done"
+			if isTable {
+				images[i].TableText = text
+				images[i].TableStatus = "done"
+			} else {
+				images[i].Text = text
+				images[i].Status = "done"
+			}
 		}
 	}
 	mu.Unlock()
-	dbUpdateText(id, text)
-	dbUpdateStatus(id, "done")
+	if isTable {
+		dbUpdateTableText(id, text)
+		dbUpdateTableStatus(id, "done")
+	} else {
+		dbUpdateText(id, text)
+		dbUpdateStatus(id, "done")
+	}
 
 	jsonOK(w, map[string]interface{}{"text": text, "status": status})
 }
@@ -319,19 +383,202 @@ func handleSaveText(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"ok": "1"})
 }
 
+func handleSaveTableText(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/table_text/")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		jsonErr(w, "invalid id")
+		return
+	}
+
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, err.Error())
+		return
+	}
+
+	mu.Lock()
+	for i := range images {
+		if images[i].ID == id {
+			images[i].TableText = req.Text
+		}
+	}
+	mu.Unlock()
+	dbUpdateTableText(id, req.Text)
+
+	jsonOK(w, map[string]string{"ok": "1"})
+}
+
 func handleExport(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	exportType := r.URL.Query().Get("type")
 	var buf strings.Builder
 	for i, item := range images {
 		if i > 0 {
 			buf.WriteString("\n\n" + strings.Repeat("=", 60) + "\n\n")
 		}
-		buf.WriteString(item.Text)
+		if exportType == "table" {
+			buf.WriteString(item.TableText)
+		} else {
+			buf.WriteString(item.Text)
+		}
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(buf.String()))
+	if exportType == "table" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<html><head><meta charset='utf-8'><style>body{font-family:sans-serif;max-width:900px;margin:20px auto;padding:0 16px}.ocr-table{border-collapse:collapse;width:100%;margin:16px 0;font-size:14px;line-height:1.6}.ocr-table th,.ocr-table td{border:1px solid #d9d9d9;padding:8px 12px;text-align:left}.ocr-table th{background:#fafafa;font-weight:600}.ocr-table tbody tr:nth-child(even){background:#fafafa}.hr{border:none;border-top:1px solid #e8e8e8;margin:32px 0}</style></head><body>" + parseMarkdownTables(buf.String()) + "</body></html>"))
+	} else {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(buf.String()))
+	}
+}
+
+func parseMarkdownTables(md string) string {
+	lines := strings.Split(md, "\n")
+	var html strings.Builder
+	inTable := false
+	var tableRows [][]string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "|") && strings.HasSuffix(trimmed, "|") {
+			if isSeparatorRow(trimmed) {
+				continue
+			}
+			cells := strings.Split(trimmed, "|")
+			if len(cells) > 2 {
+				cells = cells[1 : len(cells)-1]
+			}
+			var row []string
+			for _, c := range cells {
+				row = append(row, strings.TrimSpace(c))
+			}
+			tableRows = append(tableRows, row)
+			inTable = true
+		} else {
+			if inTable && len(tableRows) > 0 {
+				html.WriteString(buildTableHTML(tableRows))
+				tableRows = nil
+				inTable = false
+			}
+			if trimmed != "" {
+				html.WriteString("<p>" + escapeHTML(trimmed) + "</p>")
+			}
+		}
+	}
+	if inTable && len(tableRows) > 0 {
+		html.WriteString(buildTableHTML(tableRows))
+	}
+	return html.String()
+}
+
+func isSeparatorRow(s string) bool {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "|") || !strings.HasSuffix(s, "|") {
+		return false
+	}
+	s = s[1 : len(s)-1]
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return true
+	}
+	for _, c := range s {
+		if c != '-' && c != ':' && c != '|' && c != ' ' {
+			return false
+		}
+	}
+	return true
+}
+
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+func buildTableHTML(rows [][]string) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	cols := 0
+	for _, r := range rows {
+		if len(r) > cols {
+			cols = len(r)
+		}
+	}
+	var html strings.Builder
+	html.WriteString("<table class=\"ocr-table\"><thead><tr>")
+	for c := 0; c < cols; c++ {
+		val := ""
+		if c < len(rows[0]) {
+			val = rows[0][c]
+		}
+		html.WriteString("<th>" + escapeHTML(val) + "</th>")
+	}
+	html.WriteString("</tr></thead>")
+	if len(rows) > 1 {
+		html.WriteString("<tbody>")
+		for r := 1; r < len(rows); r++ {
+			html.WriteString("<tr>")
+			for c := 0; c < cols; c++ {
+				val := ""
+				if c < len(rows[r]) {
+					val = rows[r][c]
+				}
+				html.WriteString("<td>" + escapeHTML(val) + "</td>")
+			}
+			html.WriteString("</tr>")
+		}
+		html.WriteString("</tbody>")
+	}
+	html.WriteString("</table>")
+	return html.String()
+}
+
+func handleExportXlsx(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	f := excelize.NewFile()
+	defaultSheet := f.GetSheetName(0)
+	sheetIdx := 0
+	for _, item := range images {
+		if item.TableText == "" {
+			continue
+		}
+		sheetIdx++
+		sheetName := fmt.Sprintf("图片%d", sheetIdx)
+		if sheetIdx == 1 {
+			// Reuse default sheet, rename it
+			f.SetSheetName(defaultSheet, sheetName)
+		} else {
+			f.NewSheet(sheetName)
+		}
+		lines := strings.Split(item.TableText, "\n")
+		rowIdx := 1
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "|") && strings.HasSuffix(trimmed, "|") && !isSeparatorRow(trimmed) {
+				cells := strings.Split(trimmed, "|")
+				if len(cells) > 2 {
+					cells = cells[1 : len(cells)-1]
+				}
+				for ci, c := range cells {
+					colName, _ := excelize.ColumnNumberToName(ci + 1)
+					cellRef := fmt.Sprintf("%s%d", colName, rowIdx)
+					f.SetCellValue(sheetName, cellRef, strings.TrimSpace(c))
+				}
+				rowIdx++
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", "attachment; filename=多表格识别.xlsx")
+	f.Write(w)
 }
 
 // ==================== JSON Helpers ====================
@@ -362,7 +609,16 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 
 /* Toolbar */
 .toolbar{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#fff;border-bottom:1px solid #e0e0e0;flex-shrink:0}
-.toolbar h1{font-size:16px;color:#333;margin-right:12px;white-space:nowrap}
+.mode-select{position:relative;display:inline-flex;align-items:center;gap:4px;padding:6px 12px;border:1px solid #d9d9d9;border-radius:6px;cursor:pointer;user-select:none;transition:all .15s;background:#fff;font-size:14px;font-weight:500;color:#333}
+.mode-select:hover{border-color:#4096ff;color:#4096ff}
+.mode-select.open{border-color:#4096ff;box-shadow:0 0 0 2px rgba(22,119,255,.15)}
+.mode-select-arrow{font-size:10px;color:#999;transition:transform .2s}
+.mode-select.open .mode-select-arrow{transform:rotate(180deg)}
+.mode-select-dropdown{position:absolute;top:calc(100% + 4px);left:0;min-width:100%;background:#fff;border:1px solid #e8e8e8;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,.1);z-index:200;display:none;overflow:hidden}
+.mode-select.open .mode-select-dropdown{display:block}
+.mode-select-option{padding:8px 14px;font-size:13px;cursor:pointer;transition:background .1s;color:#333}
+.mode-select-option:hover{background:#f0f7ff;color:#4096ff}
+.mode-select-option.active{color:#1677ff;font-weight:500;background:#e6f4ff}
 .btn{padding:7px 16px;border:1px solid #d9d9d9;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit;background:#fff;transition:all .15s;display:inline-flex;align-items:center;gap:5px}
 .btn:hover{border-color:#4096ff;color:#4096ff}
 .btn-primary{background:#4096ff;color:#fff;border-color:#4096ff}
@@ -370,12 +626,6 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 .btn-danger{color:#ff4d4f;border-color:#ff4d4f}
 .btn-danger:hover{background:#ff4d4f;color:#fff}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.mode-toggle{display:inline-flex;border:1px solid #d9d9d9;border-radius:6px;overflow:hidden;flex-shrink:0}
-.mode-opt{padding:5px 14px;font-size:13px;cursor:pointer;border-right:1px solid #d9d9d9;transition:all .15s;user-select:none;color:#666;background:#fff}
-.mode-opt:last-child{border-right:none}
-.mode-opt:hover{color:#4096ff}
-.mode-opt.active{background:#4096ff;color:#fff}
-.mode-opt.active:hover{background:#1677ff;color:#fff}
 .btn-icon{width:32px;height:32px;border:1px solid #d9d9d9;border-radius:6px;cursor:pointer;font-size:16px;display:inline-flex;align-items:center;justify-content:center;background:#fff;transition:all .15s;padding:0}
 .btn-icon:hover{border-color:#4096ff;color:#4096ff}
 .toolbar-right{margin-left:auto;display:flex;align-items:center;gap:8px}
@@ -437,6 +687,16 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 .text-content{padding:12px 16px;min-height:60px;outline:none;font-size:14px;line-height:1.8;white-space:pre-wrap;word-break:break-word;color:#333}
 .text-content:empty:before{content:attr(data-placeholder);color:#ccc}
 .text-content:focus{background:#fafafa}
+.text-content.table-content{white-space:normal;word-break:normal}
+.ocr-table{border-collapse:collapse;width:100%;margin:8px 0;font-size:14px;line-height:1.6}
+.ocr-table th,.ocr-table td{border:1px solid #d9d9d9;padding:8px 12px;text-align:left;outline:none}
+.ocr-table td[contenteditable=true]:focus,.ocr-table th[contenteditable=true]:focus{box-shadow:inset 0 0 0 2px #4096ff;background:#fff}
+.ocr-table th{background:#fafafa;font-weight:600;white-space:nowrap;position:sticky;top:0}
+.ocr-table tbody tr:hover{background:#f0f7ff}
+.ocr-table tbody tr:nth-child(even){background:#fafafa}
+.ocr-table+.ocr-table{margin-top:16px}
+.edit-md-btn{margin-left:auto;padding:2px 8px;font-size:11px;border:1px solid #d9d9d9;border-radius:4px;cursor:pointer;background:#fff;color:#666;transition:all .15s}
+.edit-md-btn:hover{color:#4096ff;border-color:#4096ff}
 
 .empty-hint{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:#ccc}
 .empty-hint .icon{font-size:48px;margin-bottom:16px}
@@ -471,11 +731,16 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 <body>
 
 <div class="toolbar">
-  <h1>多图文本识别</h1>
-  <div class="mode-toggle" id="modeToggle">
-    <span class="mode-opt active" data-mode="ai" onclick="setMode('ai')">AI识别</span>
+  <div class="mode-select" id="modeSelect">
+    <span class="mode-select-label" id="modeLabel">多图文识别</span>
+    <span class="mode-select-arrow">&#9662;</span>
+    <div class="mode-select-dropdown" id="modeDropdown" onclick="event.stopPropagation()">
+      <div class="mode-select-option active" data-type="text" onclick="setRecogType('text')">多图文识别</div>
+      <div class="mode-select-option" data-type="table" onclick="setRecogType('table')">多表格识别</div>
+    </div>
   </div>
-  <button class="btn" onclick="exportText()">导出文本</button>
+  <button class="btn" id="btnPreview" onclick="previewText()">预览文本</button>
+  <button class="btn" id="btnExport" onclick="exportTxt()">导出txt</button>
   <button class="btn btn-danger" onclick="clearAll()">清空</button>
   <input type="file" id="fileInput" accept="image/*" multiple style="display:none" onchange="handleFiles(event)">
   <div class="toolbar-right">
@@ -563,6 +828,14 @@ let imgItems = [];
 let activeImgId = null;
 let ocrRunning = false;
 let ocrMode = 'ai';
+let recogType = localStorage.getItem('recogType') || 'text';
+// ========== Field helpers for dual mode ==========
+function getText(item) { return recogType === 'table' ? (item.table_text || '') : (item.text || ''); }
+function setText(item, val) { if (recogType === 'table') item.table_text = val; else item.text = val; }
+function getStatus(item) { return recogType === 'table' ? (item.table_status || 'ready') : (item.status || 'ready'); }
+function setStatus(item, val) { if (recogType === 'table') item.table_status = val; else item.status = val; }
+function getSaveUrl() { return recogType === 'table' ? '/api/table_text/' : '/api/text/'; }
+
 
 // Region modal state
 let regionImgId = null;
@@ -573,16 +846,33 @@ let regions = [];
 let regionDrag = {mode:'none'};
 let regionSpace = false;
 
-// ========== Mode Toggle ==========
-function setMode(mode) {
-  ocrMode = mode;
-  localStorage.setItem('ocrMode', mode);
-  document.querySelectorAll('.mode-opt').forEach(el => {
-    el.classList.toggle('active', el.dataset.mode === mode);
+// ========== Mode Select ==========
+function setRecogType(type) {
+  recogType = type;
+  ocrMode = 'ai';
+  localStorage.setItem('recogType', type);
+  localStorage.setItem('ocrMode', 'ai');
+  const label = type === 'table' ? '多表格识别' : '多图文识别';
+  document.getElementById('modeLabel').textContent = label;
+  document.querySelectorAll('.mode-select-option').forEach(el => {
+    el.classList.toggle('active', el.dataset.type === type);
   });
+  document.getElementById('modeSelect').classList.remove('open');
+  document.getElementById('btnPreview').style.display = '';
+  document.getElementById('btnExport').style.display = '';
+  document.getElementById('btnPreview').textContent = type === 'table' ? '预览表格' : '预览文本';
+  document.getElementById('btnExport').textContent = type === 'table' ? '导出xlsx' : '导出txt';
+  loadImages();
 }
-// Init toggle state
-document.addEventListener('DOMContentLoaded', () => setMode(ocrMode));
+document.addEventListener('DOMContentLoaded', () => {
+  const sel = document.getElementById('modeSelect');
+  sel.addEventListener('click', (e) => {
+    e.stopPropagation();
+    sel.classList.toggle('open');
+  });
+  document.addEventListener('click', () => sel.classList.remove('open'));
+  setRecogType(recogType);
+});
 
 // ========== API ==========
 async function api(path, opts={}) {
@@ -591,15 +881,17 @@ async function api(path, opts={}) {
 }
 
 // ========== Init ==========
-(async function init() {
+async function loadImages() {
   try {
-    const data = await api('/api/images');
+    const data = await api('/api/images?type=' + recogType);
     if (data && !data.error) {
       imgItems = data;
+      activeImgId = imgItems.length > 0 ? imgItems[0].id : null;
       render();
     }
   } catch(e) {}
-})();
+}
+loadImages();
 
 // ========== Upload ==========
 function addImages() {
@@ -615,6 +907,7 @@ async function handleFiles(e) {
     const fd = new FormData();
     fd.append('image', file);
     try {
+      fd.append('recog_type', recogType);
       const item = await api('/api/upload', {method:'POST', body:fd});
       if (item && item.id) {
         imgItems.push(item);
@@ -637,12 +930,12 @@ async function autoOCR(id, dataURL) {
     const result = await api('/api/ocr/' + id, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({image_base64: dataURL, mode: ocrMode, ...getAIConfigPayload()})
+      body: JSON.stringify({image_base64: dataURL, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
     });
     if (item.aborted) return;
     if (result && !result.error) {
-      item.text = result.text || '';
-      item.status = 'done';
+      setText(item, result.text || '');
+      setStatus(item, 'done');
     } else {
       updateItemStatus(id, 'error');
     }
@@ -655,7 +948,7 @@ async function autoOCR(id, dataURL) {
 function updateItemStatus(id, status) {
   for (let i = 0; i < imgItems.length; i++) {
     if (imgItems[i].id === id) {
-      imgItems[i].status = status;
+      setStatus(imgItems[i], status);
       break;
     }
   }
@@ -673,7 +966,7 @@ function renderSidebar() {
   let html = '';
   imgItems.forEach((item, idx) => {
     const cls = item.id === activeImgId ? 'img-card active' : 'img-card';
-    const dotCls = item.status || 'ready';
+    const dotCls = getStatus(item);
     const shortName = item.name.length > 15 ? item.name.substring(0,12)+'...' : item.name;
     html += '<div class="'+cls+'" data-id="'+item.id+'" data-idx="'+idx+'"'
       + ' onclick="selectImage('+item.id+')">'
@@ -685,7 +978,7 @@ function renderSidebar() {
       + '<div class="info"><span class="name">'+shortName+'</span>'
       + '<span class="status-dot '+dotCls+'"></span></div>'
       + '<button class="del-btn" onclick="event.stopPropagation();deleteImage('+item.id+')">&times;</button>'
-      + (item.status === 'recognizing'
+      + (getStatus(item) === 'recognizing'
         ? '<button class="ocr-btn" style="bottom:64px;background:rgba(255,0,0,.7)" onclick="event.stopPropagation();stopOCR('+item.id+')">停止</button>'
         : '<button class="ocr-btn" style="bottom:64px" onclick="event.stopPropagation();reOCR('+item.id+')">重新识别</button>')
       + '<button class="ocr-btn" onclick="event.stopPropagation();openRegionModal('+item.id+')">框选识别</button>'
@@ -697,27 +990,111 @@ function renderSidebar() {
 
 function renderTextList() {
   const list = document.getElementById('textList');
-  const hint = document.getElementById('emptyHint');
   if (imgItems.length === 0) {
     list.innerHTML = '<div class="empty-hint"><div class="icon">&#128196;</div><p>上传图片开始识别</p></div>';
     return;
   }
+  const isTable = recogType === 'table';
   let html = '';
   imgItems.forEach((item, idx) => {
-    const statusTag = getStatusTag(item.status);
+    const statusTag = getStatusTag(getStatus(item));
+    let contentHtml = isTable ? markdownTableToHtml(item.table_text || '', true) : escapeHtml(item.text || '');
+    const noTableHint = isTable && contentHtml && !contentHtml.includes('<table') && item.table_text
+      ? '<div style="padding:8px 12px;color:#fa8c16;font-size:13px;background:#fffbe6;border-radius:4px;margin:8px 0">该图片未检测到表格结构，已以文本形式展示</div>' : '';
+    const contentClass = isTable ? 'text-content table-content' : 'text-content';
+    const editable = isTable ? '' : ' contenteditable="true" onblur="saveText('+item.id+', this.textContent)"';
+    const placeholder = isTable ? '等待表格识别...' : '等待识别...';
+    const editBtn = isTable ? '' : '';
     html += '<div class="text-block" id="textBlock-'+item.id+'">'
       + '<div class="text-block-header">'
       + '<img src="'+item.data+'" alt="">'
       + '<span class="idx">图片 '+(idx+1)+'</span>'
       + '<span>'+item.name+'</span>'
-      + statusTag
+      + statusTag + editBtn
       + '</div>'
-      + '<div class="text-content" contenteditable="true" data-id="'+item.id+'"'
-      + ' data-placeholder="等待识别..."'
-      + ' onblur="saveText('+item.id+', this.textContent)">'+escapeHtml(item.text)+'</div>'
+      + '<div class="'+contentClass+'" data-id="'+item.id+'"'
+      + ' data-placeholder="'+placeholder+'"'+editable+'>'+noTableHint+contentHtml+'</div>'
       + '</div>';
   });
   list.innerHTML = html;
+}
+
+function markdownTableToHtml(md, editable) {
+  if (!md) return '';
+  const lines = md.split('\n');
+  let html = '';
+  let tableRows = [];
+  let inTable = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+      if (/^\|[\s\-:|]+$/.test(trimmed)) continue;
+      if (!inTable) inTable = true;
+      const cells = trimmed.split('|').slice(1, -1).map(c => c.trim());
+      tableRows.push(cells);
+    } else {
+      if (inTable) {
+        html += buildTableHtml(tableRows, editable);
+        tableRows = [];
+        inTable = false;
+      }
+      if (trimmed) html += '<p style="margin:4px 0;color:#666">' + escapeHtml(trimmed) + '</p>';
+    }
+  }
+  if (inTable && tableRows.length > 0) html += buildTableHtml(tableRows, editable);
+  return html;
+}
+
+function buildTableHtml(rows, editable) {
+  if (!rows.length) return '';
+  const cols = Math.max(...rows.map(r => r.length));
+  const ce = editable ? ' contenteditable="true"' : '';
+  const blur = editable ? ' onblur="saveTableCellEdit(this)"' : '';
+  let html = '<table class="ocr-table"><thead><tr>';
+  for (let c = 0; c < cols; c++) html += '<th' + ce + blur + '>' + escapeHtml(rows[0][c] || '') + '</th>';
+  html += '</tr></thead>';
+  if (rows.length > 1) {
+    html += '<tbody>';
+    for (let r = 1; r < rows.length; r++) {
+      html += '<tr>';
+      for (let c = 0; c < cols; c++) html += '<td' + ce + blur + '>' + escapeHtml(rows[r][c] || '') + '</td>';
+      html += '</tr>';
+    }
+    html += '</tbody>';
+  }
+  html += '</table>';
+  return html;
+}
+
+function editRawMarkdown(id) {
+  const item = imgItems.find(i => i.id === id);
+  if (!item) return;
+  const block = document.getElementById('textBlock-' + id);
+  const contentDiv = block.querySelector('.text-content');
+  contentDiv.style.display = 'none';
+  const ta = document.createElement('textarea');
+  ta.style.cssText = 'width:100%;min-height:200px;padding:12px;font-family:monospace;font-size:13px;border:1px solid #4096ff;border-radius:6px;resize:vertical;outline:none;line-height:1.6;box-sizing:border-box';
+  ta.value = item.table_text || '';
+  const actions = document.createElement('div');
+  actions.style.cssText = 'display:flex;gap:8px;margin:8px 16px;justify-content:flex-end';
+  actions.innerHTML = '<button class="btn" onclick="cancelEditMarkdown('+id+')">取消</button>'
+    + '<button class="btn" style="background:#1677ff;color:#fff;border-color:#1677ff" onclick="saveEditMarkdown('+id+')">保存</button>';
+  contentDiv.parentNode.insertBefore(ta, contentDiv.nextSibling);
+  ta.parentNode.insertBefore(actions, ta.nextSibling);
+  ta.focus();
+}
+function cancelEditMarkdown(id) { renderTextList(); }
+function saveEditMarkdown(id) {
+  const item = imgItems.find(i => i.id === id);
+  if (!item) return;
+  const block = document.getElementById('textBlock-' + id);
+  const ta = block.querySelector('textarea');
+  if (ta) {
+    item.table_text = ta.value;
+    api('/api/table_text/' + id, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: item.table_text})});
+  }
+  renderTextList();
 }
 
 function getStatusTag(status) {
@@ -778,11 +1155,11 @@ async function reOCR(id) {
     const result = await api('/api/ocr/' + id, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({image_base64: item.data, mode: ocrMode, ...getAIConfigPayload()})
+      body: JSON.stringify({image_base64: item.data, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
     });
     if (result && !result.error) {
-      item.text = result.text || '';
-      item.status = 'done';
+      setText(item, result.text || '');
+      setStatus(item, 'done');
     } else {
       updateItemStatus(id, 'error');
     }
@@ -818,7 +1195,7 @@ async function regionOCRById(id) {
       const result = await api('/api/ocr/' + id, {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({image_base64: b64, mode: ocrMode, ...getAIConfigPayload()})
+        body: JSON.stringify({image_base64: b64, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
       });
       if (item.aborted) break;
       if (result && !result.error && result.text) {
@@ -851,6 +1228,45 @@ function saveText(id, text) {
       if (imgItems[i].id === id) { imgItems[i].text = text; break; }
     }
   }, 800);
+}
+
+// ========== Save Table Cell Edit ==========
+function saveTableCellEdit(cell) {
+  const block = cell.closest('.text-block');
+  if (!block) return;
+  const id = parseInt(block.id.replace('textBlock-', ''));
+  // Rebuild markdown from all tables in this block
+  const md = rebuildMarkdownFromDom(block);
+  // Update local
+  const item = imgItems.find(i => i.id === id);
+  if (item) item.table_text = md;
+  // Debounced save to server
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    await api('/api/table_text/' + id, {
+      method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text: md})
+    });
+  }, 600);
+}
+
+function rebuildMarkdownFromDom(block) {
+  const tables = block.querySelectorAll('table.ocr-table');
+  let md = '';
+  tables.forEach((table, ti) => {
+    if (ti > 0) md += '\n';
+    const allRows = table.querySelectorAll('tr');
+    allRows.forEach((tr, ri) => {
+      const cells = tr.querySelectorAll('th, td');
+      const line = '| ' + Array.from(cells).map(c => c.textContent.trim()).join(' | ') + ' |';
+      md += line + '\n';
+      if (ri === 0) {
+        md += '| ' + Array.from(cells).map(() => '---').join(' | ') + ' |' + '\n';
+      }
+    });
+  });
+  return md.trim();
 }
 
 // ========== CapCut-style Pointer Drag Reorder ==========
@@ -1081,7 +1497,7 @@ async function recognizeAll() {
     api('/api/ocr/' + item.id, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({image_base64: item.data, mode: ocrMode, ...getAIConfigPayload()})
+      body: JSON.stringify({image_base64: item.data, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
     }).then(r => {
       if (item.aborted) return;
       if (r && !r.error) {
@@ -1102,7 +1518,7 @@ async function recognizeAll() {
 
 function stopAllOCR() {
   for (const item of imgItems) {
-    if (item.status === 'recognizing') {
+    if (getStatus(item) === 'recognizing') {
       item.aborted = true;
       updateItemStatus(item.id, 'ready');
     }
@@ -1120,9 +1536,27 @@ function resetOCRButton() {
 }
 
 // ========== Export ==========
-function exportText() {
+function previewText() {
+  if (imgItems.length === 0) { alert('没有内容可预览'); return; }
+  window.open('/api/export?type=' + recogType, '_blank');
+}
+
+function exportTxt() {
   if (imgItems.length === 0) { alert('没有内容可导出'); return; }
-  window.open('/api/export', '_blank');
+  if (recogType === 'table') {
+    window.location = '/api/export/xlsx';
+    return;
+  }
+  let text = '';
+  imgItems.forEach((item) => {
+    if (item.text) text += item.text + '\n\n';
+  });
+  const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '多图文识别_' + new Date().toISOString().slice(0,10) + '.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 // ========== Clear ==========
@@ -1343,7 +1777,7 @@ async function confirmRegionOCR() {
       const result = await api('/api/ocr/' + savedImgId, {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({image_base64: b64, mode: ocrMode, ...getAIConfigPayload()})
+        body: JSON.stringify({image_base64: b64, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
       });
       if (savedItem && savedItem.aborted) break;
       if (result && !result.error && result.text) {
@@ -1373,6 +1807,17 @@ let aiConfig = {
   api_url: localStorage.getItem('aiApiUrl') || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
   api_key: localStorage.getItem('aiApiKey') || ''
 };
+
+// Load persistent config from server
+async function loadServerConfig() {
+  try {
+    const cfg = await api('/api/config');
+    if (cfg.api_key) aiConfig.api_key = cfg.api_key;
+    if (cfg.api_url) aiConfig.api_url = cfg.api_url;
+    if (cfg.model) aiConfig.model = cfg.model;
+  } catch(e) {}
+}
+loadServerConfig();
 
 const presets = [
   {name:'glm-4v-flash',   label:'GLM-4V Flash (免费)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
@@ -1415,6 +1860,10 @@ function saveConfig() {
   localStorage.setItem('aiModel', aiConfig.model);
   localStorage.setItem('aiApiUrl', aiConfig.api_url);
   localStorage.setItem('aiApiKey', aiConfig.api_key);
+  // Persist to server
+  api('/api/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+    api_key: aiConfig.api_key, api_url: aiConfig.api_url, model: aiConfig.model
+  })});
   closeConfigModal();
 }
 
@@ -1433,6 +1882,42 @@ function getAIConfigPayload() {
 </html>
 `
 
+// ==================== AI Config Persistence ====================
+
+const configFile = "config.json"
+
+func loadServerConfig() map[string]string {
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		return map[string]string{}
+	}
+	var cfg map[string]string
+	if json.Unmarshal(data, &cfg) != nil {
+		return map[string]string{}
+	}
+	return cfg
+}
+
+func saveServerConfig(cfg map[string]string) {
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	os.WriteFile(configFile, data, 0644)
+}
+
+func handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := loadServerConfig()
+	jsonOK(w, cfg)
+}
+
+func handleSaveConfig(w http.ResponseWriter, r *http.Request) {
+	var cfg map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		jsonErr(w, "invalid json")
+		return
+	}
+	saveServerConfig(cfg)
+	jsonOK(w, map[string]string{"ok": "1"})
+}
+
 // ==================== Main ====================
 
 func main() {
@@ -1448,7 +1933,16 @@ func main() {
 	})
 	http.HandleFunc("/api/ocr/", handleOCR)
 	http.HandleFunc("/api/text/", handleSaveText)
+	http.HandleFunc("/api/table_text/", handleSaveTableText)
 	http.HandleFunc("/api/export", handleExport)
+	http.HandleFunc("/api/export/xlsx", handleExportXlsx)
+	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			handleGetConfig(w, r)
+		} else if r.Method == http.MethodPut {
+			handleSaveConfig(w, r)
+		}
+	})
 
 	port := "8082"
 	fmt.Printf("多图文本识别服务: http://localhost:%s\n", port)
