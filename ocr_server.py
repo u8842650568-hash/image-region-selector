@@ -13,6 +13,7 @@ import urllib.error
 import traceback
 import re
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
@@ -84,6 +85,32 @@ def ai_review(ocr_text, api_key=None, base_url=None):
     except Exception as e:
         print(f"[AI Review] Failed: {e}", file=sys.stderr)
         return ocr_text
+
+
+def _is_complete_markdown_table(text):
+    """Check if text is a single complete Markdown table. Rejects multiple tables with repeated headers."""
+    lines = text.strip().split('\n')
+    header_count = 0
+    sep_found = False
+    data_rows = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|'):
+            if re.match(r'^\|[\s\-:|]+\|$', stripped):
+                sep_found = True
+                continue
+            if sep_found:
+                # After separator: non-numeric line = likely a new table header
+                chars = stripped.replace('|', '').strip()
+                if chars and not re.search(r'\d', chars):
+                    header_count += 1
+                    sep_found = False  # reset for next table block
+                else:
+                    data_rows += 1
+            else:
+                header_count += 1
+    # Only skip Stage 2 if exactly one table header found
+    return header_count == 1 and data_rows >= 1
 
 
 def _extract_table(text):
@@ -251,56 +278,51 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
                 break
             y = y2 - OVERLAP
 
-    api_url = api_url
-    all_text = []
-
-    for i, section in enumerate(sections):
-        if len(sections) > 1:
-            print(f"[Vision-GLM] Section {i+1}/{len(sections)}...", file=sys.stderr, flush=True)
-        try:
-            _, encoded = cv2.imencode('.jpg', section, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            img_b64 = base64.b64encode(encoded.tobytes()).decode()
-        except Exception as e:
-            print(f"[Vision-GLM] Encode failed: {e}", file=sys.stderr)
-            continue
-
-        if mode == "table" or mode == "table_raw":
-            if mode == "table_raw":
-                # Stage 1: raw table extraction, per-section, no merging
-                prompt_text = (
-                    "请识别图片中的表格内容，严格按照Markdown表格格式输出。规则：\n"
-                    "1. 每个独立表格原样输出，保持表头和数据行\n"
-                    "2. 表格中的非表格文字（如编号、单位、日期等）也作为数据行输出\n"
-                    "3. 第一行是表头，用|分隔每列\n"
-                    "4. 第二行是分隔行，如|---|---|---|\n"
-                    "5. 每一列的内容只放该列对应的信息\n"
-                    "6. 不要输出任何描述、解释或总结\n"
-                    "7. 如果有多个表格，用空行分隔\n"
-                    "8. 无法确定的字符用[?]标记"
-                )
-            else:
-                # Direct table mode (fallback, no two-stage)
-                prompt_text = (
-                    "请识别图片中的表格，严格按照Markdown表格格式输出。规则：\n"
-                    "1. 第一行必须是表头，用|分隔每列\n"
-                    "2. 第二行必须是分隔行，如|---|---|---|\n"
-                    "3. 从第三行开始是数据行，每行的列数必须与表头完全一致\n"
-                    "4. 每一列的内容只放该列对应的信息，不要将多列合并到一个单元格\n"
-                    "5. 保持与原图一致的行列结构，多个表格用空行分隔\n"
-                    "6. 不要输出任何描述、解释或总结\n"
-                    "7. 无法确定的字符用[?]标记"
-                )
-            max_tokens = 1024
+    # Build prompt based on mode
+    if mode == "table" or mode == "table_raw":
+        if mode == "table_raw":
+            prompt_text = (
+                "请识别图片中的表格内容，严格按照Markdown表格格式输出。规则：\n"
+                "1. 每个独立表格原样输出，保持表头和数据行\n"
+                "2. 表格中的非表格文字（如编号、单位、日期等）也作为数据行输出\n"
+                "3. 第一行是表头，用|分隔每列\n"
+                "4. 第二行是分隔行，如|---|---|---|\n"
+                "5. 每一列的内容只放该列对应的信息\n"
+                "6. 不要输出任何描述、解释或总结\n"
+                "7. 如果有多个表格，用空行分隔\n"
+                "8. 无法确定的字符用[?]标记"
+            )
         else:
             prompt_text = (
-                "请逐字逐句识别并转录图片中的所有文字。要求：\n"
-                "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
-                "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
-                "3. 保持原始排版格式和换行\n"
-                "4. 无法确定的字符用[?]标记"
+                "请识别图片中的表格，严格按照Markdown表格格式输出。规则：\n"
+                "1. 第一行必须是表头，用|分隔每列\n"
+                "2. 第二行必须是分隔行，如|---|---|---|\n"
+                "3. 从第三行开始是数据行，每行的列数必须与表头完全一致\n"
+                "4. 每一列的内容只放该列对应的信息，不要将多列合并到一个单元格\n"
+                "5. 保持与原图一致的行列结构，多个表格用空行分隔\n"
+                "6. 不要输出任何描述、解释或总结\n"
+                "7. 无法确定的字符用[?]标记"
             )
-            max_tokens = 1024
+    else:
+        prompt_text = (
+            "请逐字逐句识别并转录图片中的所有文字。要求：\n"
+            "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
+            "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
+            "3. 保持原始排版格式和换行\n"
+            "4. 无法确定的字符用[?]标记"
+        )
 
+    # Pre-encode all sections
+    encoded_sections = []
+    for i, section in enumerate(sections):
+        try:
+            _, encoded = cv2.imencode('.jpg', section, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            img_b64 = base64.b64encode(encoded.tobytes()).decode()
+            encoded_sections.append((i, img_b64))
+        except Exception as e:
+            print(f"[Vision-GLM] Encode section {i+1} failed: {e}", file=sys.stderr)
+
+    def _call_section(idx, img_b64):
         payload = {
             "model": model,
             "messages": [{
@@ -310,10 +332,9 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
                     {"type": "text", "text": prompt_text}
                 ]
             }],
-            "max_tokens": max_tokens,
+            "max_tokens": 1024,
             "temperature": 0
         }
-
         req = urllib.request.Request(api_url,
             data=json.dumps(payload).encode(),
             headers={
@@ -322,24 +343,36 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
             }
         )
         opener = _build_opener()
+        with opener.open(req, timeout=90) as resp:
+            result = json.loads(resp.read().decode())
+            if "error" in result:
+                return idx, None, result['error']
+            text = result["choices"][0]["message"]["content"]
+            return idx, text.strip() if text and len(text.strip()) > 5 else None, None
 
-        try:
-            with opener.open(req, timeout=90) as resp:
-                result = json.loads(resp.read().decode())
-                if "error" in result:
-                    print(f"[Vision-GLM] API error: {result['error']}", file=sys.stderr, flush=True)
-                    continue
-                text = result["choices"][0]["message"]["content"]
-                if text and len(text.strip()) > 5:
-                    all_text.append(text.strip())
-                    print(f"[Vision-GLM] Section {i+1} done ({len(text)} chars)", file=sys.stderr, flush=True)
+    if len(encoded_sections) > 1:
+        print(f"[Vision-GLM] Processing {len(encoded_sections)} sections in parallel...", file=sys.stderr, flush=True)
+    all_text = [None] * len(encoded_sections)
+    with ThreadPoolExecutor(max_workers=min(len(encoded_sections), 4)) as pool:
+        futures = {pool.submit(_call_section, idx, b64): idx for idx, b64 in encoded_sections}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                ridx, text, err = future.result()
+                if err:
+                    print(f"[Vision-GLM] Section {ridx+1} API error: {err}", file=sys.stderr, flush=True)
+                elif text:
+                    all_text[ridx] = text
+                    print(f"[Vision-GLM] Section {ridx+1} done ({len(text)} chars)", file=sys.stderr, flush=True)
                 else:
-                    print(f"[Vision-GLM] Section {i+1} empty", file=sys.stderr, flush=True)
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode()[:300] if e.fp else ''
-            print(f"[Vision-GLM] Section {i+1} HTTP {e.code}: {err_body}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[Vision-GLM] Section {i+1} failed: {e}", file=sys.stderr, flush=True)
+                    print(f"[Vision-GLM] Section {ridx+1} empty", file=sys.stderr, flush=True)
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode()[:300] if e.fp else ''
+                print(f"[Vision-GLM] Section {idx+1} HTTP {e.code}: {err_body}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[Vision-GLM] Section {idx+1} failed: {e}", file=sys.stderr, flush=True)
+
+    all_text = [t for t in all_text if t]
 
     if not all_text:
         return None
@@ -414,68 +447,81 @@ def vision_ocr_minimax(img_bytes, api_key=None, api_host=None, mode="text"):
                 break
             y = y2 - OVERLAP
 
-    all_text = []
+    # Build prompt based on mode
+    if mode == "table" or mode == "table_raw":
+        prompt_text = (
+            "请识别图片中的表格内容，严格按照Markdown表格格式输出。规则：\n"
+            "1. 每个独立表格原样输出，保持表头和数据行\n"
+            "2. 表格中的非表格文字（如编号、单位、日期等）也作为数据行输出\n"
+            "3. 第一行是表头，用|分隔每列\n"
+            "4. 第二行是分隔行，如|---|---|---|\n"
+            "5. 每一列的内容只放该列对应的信息\n"
+            "6. 不要输出任何描述、解释或总结\n"
+            "7. 如果有多个表格，用空行分隔"
+        )
+    else:
+        prompt_text = (
+            "请逐字逐句识别并转录图片中的所有文字。要求：\n"
+            "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
+            "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
+            "3. 保持原始排版格式和换行\n"
+            "4. 无法确定的字符用[?]标记"
+        )
+
     endpoint = api_host.rstrip("/") + "/v1/coding_plan/vlm"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
         "MM-API-Source": "Minimax-MCP",
     }
-    opener = _build_opener()
 
+    # Pre-encode all sections
+    encoded_sections = []
     for i, section in enumerate(sections):
-        if len(sections) > 1:
-            print(f"[Vision-MiniMax] Section {i+1}/{len(sections)}...", file=sys.stderr, flush=True)
         try:
-            _, encoded = cv2.imencode('.jpg', section, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, encoded = cv2.imencode('.jpg', section, [cv2.IMWRITE_JPEG_QUALITY, 60])
             img_b64 = base64.b64encode(encoded.tobytes()).decode()
-            data_url = f"data:image/jpeg;base64,{img_b64}"
+            encoded_sections.append((i, img_b64))
         except Exception as e:
-            print(f"[Vision-MiniMax] Encode failed: {e}", file=sys.stderr)
-            continue
+            print(f"[Vision-MiniMax] Encode section {i+1} failed: {e}", file=sys.stderr)
 
-        if mode == "table" or mode == "table_raw":
-            prompt_text = (
-                "请识别图片中的表格内容，严格按照Markdown表格格式输出。规则：\n"
-                "1. 每个独立表格原样输出，保持表头和数据行\n"
-                "2. 表格中的非表格文字（如编号、单位、日期等）也作为数据行输出\n"
-                "3. 第一行是表头，用|分隔每列\n"
-                "4. 第二行是分隔行，如|---|---|---|\n"
-                "5. 每一列的内容只放该列对应的信息\n"
-                "6. 不要输出任何描述、解释或总结\n"
-                "7. 如果有多个表格，用空行分隔"
-            )
-        else:
-            prompt_text = (
-                "请逐字逐句识别并转录图片中的所有文字。要求：\n"
-                "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
-                "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
-                "3. 保持原始排版格式和换行\n"
-                "4. 无法确定的字符用[?]标记"
-            )
-
+    def _call_section(idx, img_b64):
+        data_url = f"data:image/jpeg;base64,{img_b64}"
         payload = json.dumps({"prompt": prompt_text, "image_url": data_url}).encode("utf-8")
         req = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+        opener = _build_opener()
+        with opener.open(req, timeout=90) as resp:
+            result = json.loads(resp.read().decode())
+            base_resp = result.get("base_resp", {})
+            status_code = base_resp.get("status_code", -1)
+            if status_code != 0:
+                return idx, None, f"{base_resp.get('status_msg')} (code={status_code})"
+            text = result.get("content", "")
+            return idx, text.strip() if text and len(text.strip()) > 5 else None, None
 
-        try:
-            with opener.open(req, timeout=90) as resp:
-                result = json.loads(resp.read().decode())
-                base_resp = result.get("base_resp", {})
-                status_code = base_resp.get("status_code", -1)
-                if status_code != 0:
-                    print(f"[Vision-MiniMax] Section {i+1} API error: {base_resp.get('status_msg')} (code={status_code})", file=sys.stderr, flush=True)
-                    continue
-                text = result.get("content", "")
-                if text and len(text.strip()) > 5:
-                    all_text.append(text.strip())
-                    print(f"[Vision-MiniMax] Section {i+1} done ({len(text)} chars)", file=sys.stderr, flush=True)
+    if len(encoded_sections) > 1:
+        print(f"[Vision-MiniMax] Processing {len(encoded_sections)} sections in parallel...", file=sys.stderr, flush=True)
+    all_text = [None] * len(encoded_sections)
+    with ThreadPoolExecutor(max_workers=min(len(encoded_sections), 4)) as pool:
+        futures = {pool.submit(_call_section, idx, b64): idx for idx, b64 in encoded_sections}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                ridx, text, err = future.result()
+                if err:
+                    print(f"[Vision-MiniMax] Section {ridx+1} API error: {err}", file=sys.stderr, flush=True)
+                elif text:
+                    all_text[ridx] = text
+                    print(f"[Vision-MiniMax] Section {ridx+1} done ({len(text)} chars)", file=sys.stderr, flush=True)
                 else:
-                    print(f"[Vision-MiniMax] Section {i+1} empty", file=sys.stderr, flush=True)
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode()[:300] if e.fp else ''
-            print(f"[Vision-MiniMax] Section {i+1} HTTP {e.code}: {err_body}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[Vision-MiniMax] Section {i+1} failed: {e}", file=sys.stderr, flush=True)
+                    print(f"[Vision-MiniMax] Section {ridx+1} empty", file=sys.stderr, flush=True)
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode()[:300] if e.fp else ''
+                print(f"[Vision-MiniMax] Section {idx+1} HTTP {e.code}: {err_body}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[Vision-MiniMax] Section {idx+1} failed: {e}", file=sys.stderr, flush=True)
+
+    all_text = [t for t in all_text if t]
 
     if not all_text:
         return None
@@ -554,9 +600,14 @@ class OCRHandler(BaseHTTPRequestHandler):
                 if not raw_text:
                     text = None
                 else:
-                    print(f"[Vision] Stage 1 OCR done ({len(raw_text)} chars), structuring...", file=sys.stderr, flush=True)
-                    # Stage 2: Claude structures raw text into table
-                    text = ai_structure_table(raw_text,
+                    # Check if Stage 1 output is already a complete table
+                    if _is_complete_markdown_table(raw_text):
+                        print(f"[Vision] Stage 1 output is a complete table ({len(raw_text)} chars), skipping Stage 2", file=sys.stderr, flush=True)
+                        text = raw_text
+                    else:
+                        print(f"[Vision] Stage 1 OCR done ({len(raw_text)} chars), structuring...", file=sys.stderr, flush=True)
+                        # Stage 2: Claude structures raw text into table
+                        text = ai_structure_table(raw_text,
                         api_key=ai_config.get("struct_api_key") or None,
                         base_url=ai_config.get("struct_api_url") or None,
                         model=ai_config.get("struct_model") or None)
