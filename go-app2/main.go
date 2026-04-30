@@ -811,7 +811,17 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 
       <label>API 密钥</label>
       <input type="password" id="cfgKey" placeholder="留空使用默认密钥">
-      <div class="hint">密钥仅存储在浏览器本地，不会上传到服务器</div>
+
+      <div class="hint" style="margin:12px 0 6px;font-weight:600;color:#666;">表格结构化（Stage 2）</div>
+      <label>结构化 API 地址</label>
+      <input type="text" id="cfgStructUrl" placeholder="https://open.bigmodel.cn/api/anthropic">
+
+      <label>结构化模型</label>
+      <input type="text" id="cfgStructModel" placeholder="claude-sonnet-4-20250514">
+      <div class="preset-list" id="structPresetList"></div>
+
+      <label>结构化 API 密钥</label>
+      <input type="password" id="cfgStructKey" placeholder="留空则不进行结构化处理">
     </div>
     <div class="modal-footer">
       <div class="modal-actions">
@@ -1807,6 +1817,11 @@ let aiConfig = {
   api_url: localStorage.getItem('aiApiUrl') || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
   api_key: localStorage.getItem('aiApiKey') || ''
 };
+let structConfig = {
+  api_url: localStorage.getItem('structApiUrl') || 'https://open.bigmodel.cn/api/anthropic',
+  api_key: localStorage.getItem('structApiKey') || '',
+  model: localStorage.getItem('structModel') || 'claude-sonnet-4-20250514'
+};
 
 // Load persistent config from server
 async function loadServerConfig() {
@@ -1815,6 +1830,9 @@ async function loadServerConfig() {
     if (cfg.api_key) aiConfig.api_key = cfg.api_key;
     if (cfg.api_url) aiConfig.api_url = cfg.api_url;
     if (cfg.model) aiConfig.model = cfg.model;
+    if (cfg.struct_api_url) structConfig.api_url = cfg.struct_api_url;
+    if (cfg.struct_api_key) structConfig.api_key = cfg.struct_api_key;
+    if (cfg.struct_model) structConfig.model = cfg.struct_model;
   } catch(e) {}
 }
 loadServerConfig();
@@ -1828,12 +1846,24 @@ const presets = [
   {name:'minimax-vlm',    label:'MiniMax VLM (Token Plan)', url:'https://api.minimaxi.com'},
 ];
 
+const structPresets = [
+  {name:'claude-sonnet-4-20250514', label:'Claude Sonnet 4 (智谱中转)', url:'https://open.bigmodel.cn/api/anthropic'},
+  {name:'claude-haiku-4-5-20251001', label:'Claude Haiku 4.5 (智谱中转)', url:'https://open.bigmodel.cn/api/anthropic'},
+  {name:'MiniMax-M2.7', label:'MiniMax M2.7 (Token Plan)', url:'https://api.minimaxi.com'},
+  {name:'glm-4-flash',  label:'GLM-4 Flash (智谱)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
+  {name:'gpt-4o',        label:'GPT-4o (OpenAI)', url:'https://api.openai.com/v1/chat/completions'},
+];
+
 function openConfigModal() {
   document.getElementById('cfgUrl').value = aiConfig.api_url;
   document.getElementById('cfgModel').value = aiConfig.model;
   document.getElementById('cfgKey').value = aiConfig.api_key;
+  document.getElementById('cfgStructUrl').value = structConfig.api_url;
+  document.getElementById('cfgStructKey').value = structConfig.api_key;
+  document.getElementById('cfgStructModel').value = structConfig.model;
   document.getElementById('configModal').classList.add('show');
   renderPresets();
+  renderStructPresets();
 }
 
 function closeConfigModal() {
@@ -1846,6 +1876,12 @@ function selectPreset(p) {
   renderPresets();
 }
 
+function selectStructPreset(p) {
+  document.getElementById('cfgStructUrl').value = p.url;
+  document.getElementById('cfgStructModel').value = p.name;
+  renderStructPresets();
+}
+
 function renderPresets() {
   const cur = document.getElementById('cfgModel').value;
   const container = document.getElementById('presetList');
@@ -1854,16 +1890,31 @@ function renderPresets() {
   ).join('');
 }
 
+function renderStructPresets() {
+  const cur = document.getElementById('cfgStructModel').value;
+  const container = document.getElementById('structPresetList');
+  container.innerHTML = structPresets.map(p =>
+    '<span class="preset-tag'+(p.name===cur?' active':'')+'" onclick="selectStructPreset(structPresets['+structPresets.indexOf(p)+'])">'+p.label+'</span>'
+  ).join('');
+}
+
 function saveConfig() {
   aiConfig.api_url = document.getElementById('cfgUrl').value.trim();
   aiConfig.model = document.getElementById('cfgModel').value.trim();
   aiConfig.api_key = document.getElementById('cfgKey').value.trim();
+  structConfig.api_url = document.getElementById('cfgStructUrl').value.trim();
+  structConfig.api_key = document.getElementById('cfgStructKey').value.trim();
+  structConfig.model = document.getElementById('cfgStructModel').value.trim();
   localStorage.setItem('aiModel', aiConfig.model);
   localStorage.setItem('aiApiUrl', aiConfig.api_url);
   localStorage.setItem('aiApiKey', aiConfig.api_key);
+  localStorage.setItem('structApiUrl', structConfig.api_url);
+  localStorage.setItem('structApiKey', structConfig.api_key);
+  localStorage.setItem('structModel', structConfig.model);
   // Persist to server
   api('/api/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
-    api_key: aiConfig.api_key, api_url: aiConfig.api_url, model: aiConfig.model
+    api_key: aiConfig.api_key, api_url: aiConfig.api_url, model: aiConfig.model,
+    struct_api_url: structConfig.api_url, struct_api_key: structConfig.api_key, struct_model: structConfig.model
   })});
   closeConfigModal();
 }
@@ -1874,7 +1925,10 @@ function getAIConfigPayload() {
     ai_config: {
       model: aiConfig.model,
       api_url: aiConfig.api_url,
-      api_key: aiConfig.api_key
+      api_key: aiConfig.api_key,
+      struct_api_url: structConfig.api_url,
+      struct_api_key: structConfig.api_key,
+      struct_model: structConfig.model
     }
   };
 }

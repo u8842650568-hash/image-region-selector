@@ -17,28 +17,26 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
 def _build_opener():
-    proxy = os.environ.get("http_proxy", os.environ.get("HTTP_PROXY", "http://127.0.0.1:7890"))
-    if proxy:
-        return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    return urllib.request.build_opener()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({})
+    )
 
 
-def _api_headers():
+def _api_headers(api_key=None):
     return {
         "Content-Type": "application/json",
-        "x-api-key": os.environ.get("VISION_API_KEY", ""),
+        "x-api-key": api_key or os.environ.get("VISION_API_KEY", ""),
         "anthropic-version": "2023-06-01",
     }
 
 
-def ai_review(ocr_text):
+def ai_review(ocr_text, api_key=None, base_url=None):
     """Call AI to review and fix OCR text errors. Returns reviewed text or original on failure."""
-    api_key = os.environ.get("VISION_API_KEY", "")
+    api_key = api_key or os.environ.get("VISION_API_KEY", "")
     if not api_key:
         return ocr_text
 
-    base_url = os.environ.get("VISION_API_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
+    base_url = base_url or os.environ.get("VISION_API_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
     req_body = json.dumps({
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 8192,
@@ -65,7 +63,7 @@ def ai_review(ocr_text):
     req = urllib.request.Request(
         base_url + "/v1/messages",
         data=req_body,
-        headers=_api_headers(),
+        headers=_api_headers(api_key),
         method="POST",
     )
     opener = _build_opener()
@@ -88,16 +86,38 @@ def ai_review(ocr_text):
         return ocr_text
 
 
-def ai_structure_table(ocr_text):
-    """Call Claude to convert raw OCR text into structured merged table."""
-    base_url = os.environ.get("VISION_API_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
-    req_body = json.dumps({
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": 8192,
-        "temperature": 0,
-        "messages": [{
-            "role": "user",
-            "content": f"""以下是OCR从一张单据图片中转录出的原始文字（可能格式混乱）。请将其整理为一个结构化的Markdown表格。
+def _extract_table(text):
+    """Extract first Markdown table from text, stripping any thinking/reasoning before it."""
+    # Find first line starting with |
+    lines = text.split('\n')
+    table_start = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('|') and '序号' in stripped:
+            table_start = i
+            break
+    if table_start >= 0:
+        return '\n'.join(lines[table_start:])
+    # Fallback: find any line starting with |
+    for i, line in enumerate(lines):
+        if line.strip().startswith('|'):
+            table_start = i
+            break
+    if table_start >= 0:
+        return '\n'.join(lines[table_start:])
+    return text
+
+
+def ai_structure_table(ocr_text, api_key=None, base_url=None, model=None):
+    """Call AI to convert raw OCR text into structured merged table.
+    Supports Anthropic Messages API and OpenAI Chat Completions API based on base_url/model."""
+    api_key = api_key or os.environ.get("VISION_API_KEY", "")
+    base_url = base_url or os.environ.get("VISION_API_BASE_URL", "https://open.bigmodel.cn/api/anthropic")
+    model = model or "claude-sonnet-4-20250514"
+    if not api_key:
+        return None
+
+    prompt = f"""以下是OCR从一张单据图片中转录出的原始文字（可能格式混乱）。请将其整理为一个结构化的Markdown表格。
 
 重要提示：
 - OCR原文可能将相邻两条记录横向拼在同一行（如 | 编号A | 编号B |），你需要将它们拆分为独立的行
@@ -111,7 +131,7 @@ def ai_structure_table(ocr_text):
 4. 所有记录合并为一个表格，数据行按编号顺序排列，序号递增
 5. 每一列的内容只放该列对应的信息
 6. 只输出一个完整的Markdown表格，不要输出多个表格
-7. 不要输出任何描述、解释或总结
+7. 不要输出任何描述、解释、总结或思考过程，直接输出表格
 8. 严格忠实于原文数据，不要编造或猜测数据
 9. 统计原文中出现了多少个不同的编号，确保输出的数据行数量与编号数量完全一致
 
@@ -126,29 +146,64 @@ def ai_structure_table(ocr_text):
 
 ---结构化表格---
 """
-        }]
-    }).encode("utf-8")
 
-    req = urllib.request.Request(
-        base_url + "/v1/messages",
-        data=req_body,
-        headers=_api_headers(),
-        method="POST",
-    )
+    # Detect API format: Anthropic vs OpenAI
+    use_anthropic = "/anthropic" in base_url or model.startswith("claude")
+
+    if use_anthropic:
+        req_body = json.dumps({
+            "model": model,
+            "max_tokens": 8192,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode("utf-8")
+        base = base_url.rstrip("/")
+        endpoint = base + "/v1/messages" if not base.endswith("/messages") else base
+        headers = _api_headers(api_key)
+    else:
+        req_body = json.dumps({
+            "model": model,
+            "max_tokens": 8192,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode("utf-8")
+        # Avoid double path if URL already includes /v1/chat/completions or /v1/messages
+        base = base_url.rstrip("/")
+        if base.endswith("/chat/completions") or base.endswith("/messages"):
+            endpoint = base
+        else:
+            endpoint = base + "/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+    req = urllib.request.Request(endpoint, data=req_body, headers=headers, method="POST")
     opener = _build_opener()
 
     try:
-        print("[Structure] Calling Claude...", file=sys.stderr, flush=True)
+        print(f"[Structure] Calling {model}...", file=sys.stderr, flush=True)
         with opener.open(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            content = data.get("content", [])
-            if content and isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text = block.get("text", "")
-                        if text.strip():
-                            print(f"[Structure] Done ({len(text)} chars)", file=sys.stderr, flush=True)
-                            return text
+            if use_anthropic:
+                content = data.get("content", [])
+                if content and isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text.strip():
+                                text = _extract_table(text)
+                                print(f"[Structure] Done ({len(text)} chars)", file=sys.stderr, flush=True)
+                                return text
+            else:
+                # OpenAI format
+                choices = data.get("choices", [])
+                if choices:
+                    text = choices[0].get("message", {}).get("content", "")
+                    if text.strip():
+                        text = _extract_table(text)
+                        print(f"[Structure] Done ({len(text)} chars)", file=sys.stderr, flush=True)
+                        return text
     except Exception as e:
         print(f"[Structure] Failed: {e}", file=sys.stderr, flush=True)
     return None
@@ -220,7 +275,8 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
                     "4. 第二行是分隔行，如|---|---|---|\n"
                     "5. 每一列的内容只放该列对应的信息\n"
                     "6. 不要输出任何描述、解释或总结\n"
-                    "7. 如果有多个表格，用空行分隔"
+                    "7. 如果有多个表格，用空行分隔\n"
+                    "8. 无法确定的字符用[?]标记"
                 )
             else:
                 # Direct table mode (fallback, no two-stage)
@@ -231,7 +287,8 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
                     "3. 从第三行开始是数据行，每行的列数必须与表头完全一致\n"
                     "4. 每一列的内容只放该列对应的信息，不要将多列合并到一个单元格\n"
                     "5. 保持与原图一致的行列结构，多个表格用空行分隔\n"
-                    "6. 不要输出任何描述、解释或总结"
+                    "6. 不要输出任何描述、解释或总结\n"
+                    "7. 无法确定的字符用[?]标记"
                 )
             max_tokens = 1024
         else:
@@ -264,13 +321,10 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
                 "Authorization": f"Bearer {api_key}"
             }
         )
-        # Use direct connection for zhipu API (proxy may cause 1210 error)
-        direct_opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({})
-        )
+        opener = _build_opener()
 
         try:
-            with direct_opener.open(req, timeout=90) as resp:
+            with opener.open(req, timeout=90) as resp:
                 result = json.loads(resp.read().decode())
                 if "error" in result:
                     print(f"[Vision-GLM] API error: {result['error']}", file=sys.stderr, flush=True)
@@ -502,7 +556,10 @@ class OCRHandler(BaseHTTPRequestHandler):
                 else:
                     print(f"[Vision] Stage 1 OCR done ({len(raw_text)} chars), structuring...", file=sys.stderr, flush=True)
                     # Stage 2: Claude structures raw text into table
-                    text = ai_structure_table(raw_text)
+                    text = ai_structure_table(raw_text,
+                        api_key=ai_config.get("struct_api_key") or None,
+                        base_url=ai_config.get("struct_api_url") or None,
+                        model=ai_config.get("struct_model") or None)
                     if text is None:
                         text = raw_text  # fallback to raw OCR
                         print("[Vision] Structure failed, using raw OCR", file=sys.stderr, flush=True)
