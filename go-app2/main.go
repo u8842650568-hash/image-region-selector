@@ -319,7 +319,7 @@ func handleOCR(w http.ResponseWriter, r *http.Request) {
 		} else {
 			dbUpdateStatus(id, "error")
 		}
-		jsonErr(w, "OCR服务不可用: "+err.Error())
+		jsonErr(w, "识别服务不可用: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -602,7 +602,7 @@ const htmlPage = `
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>多图文本识别</title>
+<title>多图识别</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans-serif;background:#f5f5f5;height:100vh;display:flex;flex-direction:column;overflow:hidden;color:#333}
@@ -1007,7 +1007,8 @@ function renderTextList() {
   const isTable = recogType === 'table';
   let html = '';
   imgItems.forEach((item, idx) => {
-    const statusTag = getStatusTag(getStatus(item));
+    const status = getStatus(item);
+    const statusTag = getStatusTag(status);
     let contentHtml = isTable ? markdownTableToHtml(item.table_text || '', true) : escapeHtml(item.text || '');
     const noTableHint = isTable && contentHtml && !contentHtml.includes('<table') && item.table_text
       ? '<div style="padding:8px 12px;color:#fa8c16;font-size:13px;background:#fffbe6;border-radius:4px;margin:8px 0">该图片未检测到表格结构，已以文本形式展示</div>' : '';
@@ -1015,6 +1016,9 @@ function renderTextList() {
     const editable = isTable ? '' : ' contenteditable="true" onblur="saveText('+item.id+', this.textContent)"';
     const placeholder = isTable ? '等待表格识别...' : '等待识别...';
     const editBtn = isTable ? '' : '';
+    const ocrBtn = (status === 'ready')
+      ? '<button style="margin-top:8px;padding:6px 16px;border:1px solid #1890ff;background:#1890ff;color:#fff;border-radius:4px;cursor:pointer;font-size:13px" onclick="startOcr('+item.id+')">开始识别</button>'
+      : '';
     html += '<div class="text-block" id="textBlock-'+item.id+'">'
       + '<div class="text-block-header">'
       + '<img src="'+item.data+'" alt="">'
@@ -1024,6 +1028,7 @@ function renderTextList() {
       + '</div>'
       + '<div class="'+contentClass+'" data-id="'+item.id+'"'
       + ' data-placeholder="'+placeholder+'"'+editable+'>'+noTableHint+contentHtml+'</div>'
+      + ocrBtn
       + '</div>';
   });
   list.innerHTML = html;
@@ -2000,6 +2005,6 @@ func main() {
 	})
 
 	port := "8082"
-	fmt.Printf("多图文本识别服务: http://localhost:%s\n", port)
+	fmt.Printf("多图识别服务: http://localhost:%s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

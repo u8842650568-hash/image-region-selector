@@ -87,6 +87,121 @@ def ai_review(ocr_text, api_key=None, base_url=None):
         return ocr_text
 
 
+def _clean_boundary(text):
+    """Clean truncated/fragmented text at section boundaries."""
+    lines = text.split('\n')
+
+    # Remove orphan lines at start (< 3 chars)
+    start = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if len(stripped) <= 3 and i < len(lines) - 1 and lines[i+1].strip():
+            start = i + 1
+        else:
+            break
+
+    # Remove truncation garbage at end: scan backwards, count consecutive short lines
+    # >=5 consecutive short lines (<=5 chars) from end = truncation signal
+    end = len(lines)
+    consec_short = 0
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        if len(stripped) <= 5:
+            consec_short += 1
+        else:
+            break
+    if consec_short >= 5:
+        i = len(lines) - 1
+        while i >= 0:
+            stripped = lines[i].strip()
+            if not stripped:
+                i -= 1
+                continue
+            if len(stripped) <= 5:
+                i -= 1
+                continue
+            break
+        end = i + 1
+
+    return '\n'.join(lines[start:end])
+
+
+def _merge_sections(all_text, mode="text"):
+    """Merge multiple OCR sections with overlap deduplication."""
+    if len(all_text) <= 1:
+        return all_text[0] if all_text else None
+
+    # Pre-clean each section to remove truncation garbage
+    if mode == "text":
+        all_text = [_clean_boundary(t) for t in all_text]
+
+    merged = [all_text[0]]
+    for section in all_text[1:]:
+        prev_lines = merged[-1].split('\n')
+        curr_lines = section.split('\n')
+
+        if mode == "text":
+            # Text mode: find best matching line in curr within prev's tail region
+            # Skip very short lines at start of curr (likely edge fragments)
+            skip_leading = 0
+            for cl in curr_lines:
+                if cl.strip() and len(cl.strip()) < 10:
+                    skip_leading += 1
+                else:
+                    break
+
+            best_ratio = 0
+            best_curr_idx = -1
+            best_prev_idx = -1
+            for ci in range(skip_leading, min(len(curr_lines), skip_leading + 30)):
+                curr_line = curr_lines[ci].strip()
+                if len(curr_line) < 15:
+                    continue
+                for pi in range(max(0, len(prev_lines) - 30), len(prev_lines)):
+                    prev_line = prev_lines[pi].strip()
+                    if len(prev_line) < 15:
+                        continue
+                    ratio = difflib.SequenceMatcher(None, prev_line, curr_line).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_curr_idx = ci
+                        best_prev_idx = pi
+
+            if best_ratio >= 0.6 and best_curr_idx > 0:
+                merged.append('\n'.join(curr_lines[best_curr_idx:]))
+            else:
+                merged.append(section)
+        else:
+            # Table mode: exact + fuzzy line-by-line
+            best_overlap = 0
+            for n in range(1, min(8, len(prev_lines), len(curr_lines) + 1)):
+                prev_tail = [l.strip() for l in prev_lines[-n:] if l.strip()]
+                curr_head = [l.strip() for l in curr_lines[:n] if l.strip()]
+                if prev_tail and curr_head and prev_tail == curr_head:
+                    best_overlap = n
+                elif prev_tail and curr_head:
+                    ratio = difflib.SequenceMatcher(None, '\n'.join(prev_tail), '\n'.join(curr_head)).ratio()
+                    if ratio < 0.6:
+                        break
+                    best_overlap = n
+            if best_overlap > 0:
+                merged.append('\n'.join(curr_lines[best_overlap:]))
+            else:
+                merged.append(section)
+
+    result = '\n\n'.join(merged)
+
+    # Global dedup for text mode: remove repeated question blocks
+    if mode == "text":
+        result = _dedup_questions(result)
+
+    return result
+
+
 def _is_complete_markdown_table(text):
     """Check if text is a single complete Markdown table. Rejects multiple tables with repeated headers."""
     lines = text.strip().split('\n')
@@ -111,6 +226,37 @@ def _is_complete_markdown_table(text):
                 header_count += 1
     # Only skip Stage 2 if exactly one table header found
     return header_count == 1 and data_rows >= 1
+
+
+def _dedup_questions(text):
+    """Remove duplicate question blocks in text (e.g. '31. C 【解析】' appearing twice)."""
+    lines = text.split('\n')
+    seen_starts = {}  # line content -> first occurrence index
+    deduped = []
+    skip_until_change = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Detect question start pattern: "N. X 【解析】"
+        m = re.match(r'^(\d+)\.\s*[A-Z]\s*【', stripped)
+        if m:
+            q_key = m.group(1)
+            if q_key in seen_starts:
+                skip_until_change = True
+                continue
+            seen_starts[q_key] = i
+            skip_until_change = False
+
+        if skip_until_change:
+            # Keep skipping until we see a new question start
+            if m and m.group(1) not in seen_starts:
+                skip_until_change = False
+            else:
+                continue
+
+        deduped.append(line)
+
+    return '\n'.join(deduped)
 
 
 def _extract_table(text):
@@ -308,8 +454,9 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
             "请逐字逐句识别并转录图片中的所有文字。要求：\n"
             "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
             "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
-            "3. 保持原始排版格式和换行\n"
-            "4. 无法确定的字符用[?]标记"
+            "3. 按语义完整分行，一句完整的话放在同一行，不要在句子中间断行\n"
+            "4. 段落之间用空行分隔\n"
+            "5. 无法确定的字符用[?]标记"
         )
 
     # Pre-encode all sections
@@ -377,32 +524,7 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
     if not all_text:
         return None
 
-    if len(all_text) == 1:
-        return all_text[0]
-
-    # Merge sections: remove overlapping content
-    merged = [all_text[0]]
-    for section in all_text[1:]:
-        prev_lines = merged[-1].split('\n')
-        curr_lines = section.split('\n')
-        best_overlap = 0
-        for n in range(1, min(8, len(prev_lines), len(curr_lines) + 1)):
-            prev_tail = [l.strip() for l in prev_lines[-n:] if l.strip()]
-            curr_head = [l.strip() for l in curr_lines[:n] if l.strip()]
-            if prev_tail and curr_head and prev_tail == curr_head:
-                best_overlap = n
-            elif prev_tail and curr_head:
-                ratio = difflib.SequenceMatcher(None, '\n'.join(prev_tail), '\n'.join(curr_head)).ratio()
-                if ratio < 0.6:
-                    break
-                best_overlap = n
-
-        if best_overlap > 0:
-            merged.append('\n'.join(curr_lines[best_overlap:]))
-        else:
-            merged.append(section)
-
-    return '\n'.join(merged)
+    return _merge_sections(all_text, mode=mode)
 
 
 def vision_ocr_minimax(img_bytes, api_key=None, api_host=None, mode="text"):
@@ -464,8 +586,9 @@ def vision_ocr_minimax(img_bytes, api_key=None, api_host=None, mode="text"):
             "请逐字逐句识别并转录图片中的所有文字。要求：\n"
             "1. 只输出图片中实际存在的文字，严格禁止添加任何描述、解释、总结或评论\n"
             "2. 不要输出类似这是一张、以下是、请注意等任何非原文内容\n"
-            "3. 保持原始排版格式和换行\n"
-            "4. 无法确定的字符用[?]标记"
+            "3. 按语义完整分行，一句完整的话放在同一行，不要在句子中间断行\n"
+            "4. 段落之间用空行分隔\n"
+            "5. 无法确定的字符用[?]标记"
         )
 
     endpoint = api_host.rstrip("/") + "/v1/coding_plan/vlm"
@@ -526,34 +649,10 @@ def vision_ocr_minimax(img_bytes, api_key=None, api_host=None, mode="text"):
     if not all_text:
         return None
 
-    if len(all_text) == 1:
-        return all_text[0]
-
-    # Merge sections: remove overlapping content (same logic as vision_ocr_glm)
-    merged = [all_text[0]]
-    for section in all_text[1:]:
-        prev_lines = merged[-1].split('\n')
-        curr_lines = section.split('\n')
-        best_overlap = 0
-        for n in range(1, min(8, len(prev_lines), len(curr_lines) + 1)):
-            prev_tail = [l.strip() for l in prev_lines[-n:] if l.strip()]
-            curr_head = [l.strip() for l in curr_lines[:n] if l.strip()]
-            if prev_tail and curr_head and prev_tail == curr_head:
-                best_overlap = n
-            elif prev_tail and curr_head:
-                ratio = difflib.SequenceMatcher(None, '\n'.join(prev_tail), '\n'.join(curr_head)).ratio()
-                if ratio < 0.6:
-                    break
-                best_overlap = n
-        if best_overlap > 0:
-            merged.append('\n'.join(curr_lines[best_overlap:]))
-        else:
-            merged.append(section)
-
-    return '\n'.join(merged)
+    return _merge_sections(all_text, mode=mode)
 
 
-class OCRHandler(BaseHTTPRequestHandler):
+class VisionHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/ocr":
             self.handle_ocr()
@@ -605,7 +704,7 @@ class OCRHandler(BaseHTTPRequestHandler):
                         print(f"[Vision] Stage 1 output is a complete table ({len(raw_text)} chars), skipping Stage 2", file=sys.stderr, flush=True)
                         text = raw_text
                     else:
-                        print(f"[Vision] Stage 1 OCR done ({len(raw_text)} chars), structuring...", file=sys.stderr, flush=True)
+                        print(f"[Vision] Stage 1 done ({len(raw_text)} chars), structuring...", file=sys.stderr, flush=True)
                         # Stage 2: Claude structures raw text into table
                         text = ai_structure_table(raw_text,
                         api_key=ai_config.get("struct_api_key") or None,
@@ -613,7 +712,7 @@ class OCRHandler(BaseHTTPRequestHandler):
                         model=ai_config.get("struct_model") or None)
                     if text is None:
                         text = raw_text  # fallback to raw OCR
-                        print("[Vision] Structure failed, using raw OCR", file=sys.stderr, flush=True)
+                        print("[Vision] Structure failed, using raw text", file=sys.stderr, flush=True)
             else:
                 if is_minimax:
                     text = vision_ocr_minimax(img_bytes,
@@ -650,14 +749,14 @@ class OCRHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        print(f"[OCR] {args[0]}")
+        print(f"[Vision] {args[0]}")
 
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8081
-    server = HTTPServer(("127.0.0.1", port), OCRHandler)
-    print(f"OCR service running on http://127.0.0.1:{port}")
-    print(f"  POST /ocr     - AI vision OCR")
+    server = HTTPServer(("127.0.0.1", port), VisionHandler)
+    print(f"Vision service running on http://127.0.0.1:{port}")
+    print(f"  POST /ocr     - AI vision recognition")
     print(f"  GET  /health   - health check")
     server.serve_forever()
 
