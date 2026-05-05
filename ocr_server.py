@@ -1102,7 +1102,7 @@ class VisionHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8081
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 29818
     server = ThreadingHTTPServer(("127.0.0.1", port), VisionHandler)
     print(f"Vision service running on http://127.0.0.1:{port}")
     print(f"  POST /ocr     - AI vision recognition")

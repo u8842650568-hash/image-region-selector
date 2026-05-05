@@ -18,7 +18,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-const ocrURL = "http://127.0.0.1:8081"
+const ocrURL = "http://127.0.0.1:29818"
 
 // ==================== Data Model ====================
 
@@ -805,8 +805,8 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 .modal-header .close-btn:hover{background:#f0f0f0}
 .modal-body{flex:1;display:flex;overflow:hidden}
 .modal-canvas-wrap{flex:1;position:relative;background:#1a1a2e;overflow:hidden}
-.modal-canvas-wrap canvas{cursor:crosshair}
-.modal-hint{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.6);color:#fff;padding:6px 16px;border-radius:20px;font-size:12px;pointer-events:none}
+.modal-canvas-wrap canvas{cursor:crosshair;position:relative;z-index:1}
+.modal-hint{position:absolute;top:8px;left:12px;background:rgba(0,0,0,.55);color:#fff;padding:4px 14px;border-radius:12px;font-size:11px;pointer-events:none;z-index:5}
 .modal-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid #e8e8e8}
 .modal-actions{display:flex;gap:8px;margin-left:auto}
 .config-form{padding:20px 24px;flex:1;overflow-y:auto}
@@ -873,8 +873,8 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
     </div>
     <div class="modal-body">
       <div class="modal-canvas-wrap" id="modalCanvasWrap">
-        <canvas id="modalCanvas"></canvas>
         <div class="modal-hint">拖拽框选识别区域，右键删除，滚轮缩放，空格+拖拽平移</div>
+        <canvas id="modalCanvas"></canvas>
       </div>
     </div>
     <div class="modal-footer">
@@ -2174,7 +2174,7 @@ func main() {
 		}
 	})
 
-	port := "8082"
+	port := "29817"
 	fmt.Printf("多图识别服务: http://localhost:%s\n", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
