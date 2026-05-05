@@ -33,6 +33,7 @@ type ImageItem struct {
 	TableStatus string `json:"table_status"` // table recognition status
 	RecogType  string `json:"recog_type"` // "text" or "table"
 	Order      int    `json:"order"`
+	Regions    string `json:"regions,omitempty"`
 }
 
 var (
@@ -64,11 +65,12 @@ func initDB() {
 	db.Exec("ALTER TABLE images ADD COLUMN table_text TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE images ADD COLUMN table_status TEXT DEFAULT 'ready'")
 	db.Exec("ALTER TABLE images ADD COLUMN recog_type TEXT DEFAULT 'text'")
+	db.Exec("ALTER TABLE images ADD COLUMN regions TEXT DEFAULT ''")
 	loadFromDB()
 }
 
 func loadFromDB() {
-	rows, err := db.Query("SELECT id, name, data, text, table_text, status, table_status, recog_type, sort_order FROM images ORDER BY sort_order")
+	rows, err := db.Query("SELECT id, name, data, text, table_text, status, table_status, recog_type, sort_order, regions FROM images ORDER BY sort_order")
 	if err != nil {
 		log.Println("DB load:", err)
 		return
@@ -78,7 +80,7 @@ func loadFromDB() {
 	maxID := 0
 	for rows.Next() {
 		var item ImageItem
-		rows.Scan(&item.ID, &item.Name, &item.Data, &item.Text, &item.TableText, &item.Status, &item.TableStatus, &item.RecogType, &item.Order)
+		rows.Scan(&item.ID, &item.Name, &item.Data, &item.Text, &item.TableText, &item.Status, &item.TableStatus, &item.RecogType, &item.Order, &item.Regions)
 		item.Thumb = item.Data
 		images = append(images, item)
 		if item.ID > maxID {
@@ -99,6 +101,9 @@ func dbInsert(item ImageItem) {
 
 func dbUpdateText(id int, text string) {
 	db.Exec("UPDATE images SET text = ? WHERE id = ?", text, id)
+}
+func dbUpdateRegions(id int, regions string) {
+	db.Exec("UPDATE images SET regions = ? WHERE id = ?", regions, id)
 }
 func dbUpdateTableText(id int, text string) {
 	db.Exec("UPDATE images SET table_text = ? WHERE id = ?", text, id)
@@ -371,6 +376,52 @@ func handleOCR(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"text": text, "status": status})
 }
 
+func handleOCRRegion(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ImageBase64 string                 `json:"image_base64"`
+		Regions     []struct {
+			Points []struct {
+				X float64 `json:"x"`
+				Y float64 `json:"y"`
+			} `json:"points"`
+		} `json:"regions"`
+		Mode      string                 `json:"mode"`
+		RecogType string                 `json:"recog_type"`
+		AIConfig  map[string]interface{} `json:"ai_config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, err.Error())
+		return
+	}
+
+	ocrReq := map[string]interface{}{
+		"image_base64": req.ImageBase64,
+		"regions":      req.Regions,
+	}
+	if req.Mode != "" {
+		ocrReq["mode"] = req.Mode
+	}
+	if req.RecogType != "" {
+		ocrReq["recog_type"] = req.RecogType
+	}
+	if req.AIConfig != nil {
+		ocrReq["ai_config"] = req.AIConfig
+	}
+	bodyBytes, _ := json.Marshal(ocrReq)
+
+	resp, err := http.Post(ocrURL+"/ocr/region", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		jsonErr(w, "识别服务不可用: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	var result map[string]interface{}
+	json.Unmarshal(respBody, &result)
+	jsonOK(w, result)
+}
+
 func handleSaveText(w http.ResponseWriter, r *http.Request) {
 	idStr := strings.TrimPrefix(r.URL.Path, "/api/text/")
 	id, err := strconv.Atoi(idStr)
@@ -396,6 +447,31 @@ func handleSaveText(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 	dbUpdateText(id, req.Text)
 
+	jsonOK(w, map[string]string{"ok": "1"})
+}
+
+func handleSaveRegions(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/regions/")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		jsonErr(w, "invalid id")
+		return
+	}
+	var req struct {
+		Regions string `json:"regions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, err.Error())
+		return
+	}
+	mu.Lock()
+	for i := range images {
+		if images[i].ID == id {
+			images[i].Regions = req.Regions
+		}
+	}
+	mu.Unlock()
+	dbUpdateRegions(id, req.Regions)
 	jsonOK(w, map[string]string{"ok": "1"})
 }
 
@@ -870,7 +946,7 @@ let regionImg = null;
 let regionCanvas, regionCtx;
 let regionView = {x:0,y:0,scale:1,base:1};
 let regions = [];
-let regionDrag = {mode:'none'};
+let regionDrag = {mode:'none', regionIdx:-1, cornerIdx:-1};
 let regionSpace = false;
 
 // ========== Mode Select ==========
@@ -912,7 +988,10 @@ async function loadImages() {
   try {
     const data = await api('/api/images?type=' + recogType);
     if (data && !data.error) {
-      imgItems = data;
+      imgItems = (data || []).map(item => {
+        if (item.regions && typeof item.regions === 'string') item.regions = JSON.parse(item.regions);
+        return item;
+      });
       activeImgId = imgItems.length > 0 ? imgItems[0].id : null;
       render();
     }
@@ -1208,37 +1287,21 @@ async function regionOCRById(id) {
   updateItemStatus(id, 'recognizing');
   render();
 
-  const img = new Image();
-  img.src = item.data;
-  await new Promise(r => { img.onload = r; });
+  try {
+    const payload = {image_base64: item.data, regions: item.regions, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()};
+    const result = await api('/api/ocr/region', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!item.aborted && result && !result.error && result.text) {
+      item.text = result.text;
+      item.status = 'done';
+      saveText(id, result.text);
+    }
+  } catch(e) {}
 
-  let allText = '';
-  for (const r of item.regions) {
-    if (item.aborted) break;
-    const sw = Math.round(r.x2 - r.x1), sh = Math.round(r.y2 - r.y1);
-    if (sw <= 0 || sh <= 0) continue;
-    const tmpC = document.createElement('canvas');
-    tmpC.width = sw; tmpC.height = sh;
-    tmpC.getContext('2d').drawImage(img, r.x1, r.y1, sw, sh, 0, 0, sw, sh);
-    const b64 = tmpC.toDataURL('image/png');
-    try {
-      const result = await api('/api/ocr/' + id, {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({image_base64: b64, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
-      });
-      if (item.aborted) break;
-      if (result && !result.error && result.text) {
-        if (allText) allText += '\n\n';
-        allText += result.text;
-      }
-    } catch(e) { if (item.aborted) break; }
-  }
-
-  if (!item.aborted) {
-    item.text = allText;
-    item.status = 'done';
-  }
+  if (item.aborted) { item.status = 'ready'; }
   delete item.aborted;
   render();
 }
@@ -1612,8 +1675,11 @@ function openRegionModal(id) {
   btn.textContent = '识别选定区域';
   regionCanvas = document.getElementById('modalCanvas');
   regionCtx = regionCanvas.getContext('2d');
-  // Restore saved regions
-  regions = item.regions ? JSON.parse(JSON.stringify(item.regions)) : [];
+  // Restore saved regions (migrate old rect format to quad)
+  regions = (item.regions || []).map(r => {
+    if (r.points) return JSON.parse(JSON.stringify(r));
+    return {points:[{x:r.x1,y:r.y1},{x:r.x2,y:r.y1},{x:r.x2,y:r.y2},{x:r.x1,y:r.y2}]};
+  });
 
   regionImg = new Image();
   regionImg.onload = () => {
@@ -1626,7 +1692,11 @@ function closeRegionModal() {
   // Save regions to item before closing
   if (regionImgId) {
     const item = imgItems.find(i => i.id === regionImgId);
-    if (item) item.regions = JSON.parse(JSON.stringify(regions));
+    if (item) {
+      const r = JSON.stringify(regions);
+      item.regions = JSON.parse(r);
+      api('/api/regions/' + regionImgId, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({regions: r})});
+    }
   }
   document.getElementById('regionModal').classList.remove('show');
   regionImgId = null;
@@ -1665,19 +1735,34 @@ function redrawRegion() {
 
   const colors = ['#00ff88','#ff4466','#44aaff','#ffaa00','#cc66ff'];
   regions.forEach((r, i) => {
-    const p1 = rToC(r.x1, r.y1);
-    const p2 = rToC(r.x2, r.y2);
+    const pts = r.points.map(p => rToC(p.x, p.y));
     const color = colors[i % colors.length];
+    // Filled polygon
+    c.beginPath();
+    c.moveTo(pts[0].x, pts[0].y);
+    for (let j = 1; j < 4; j++) c.lineTo(pts[j].x, pts[j].y);
+    c.closePath();
     c.fillStyle = color + '25';
-    c.fillRect(p1.x, p1.y, p2.x-p1.x, p2.y-p1.y);
+    c.fill();
     c.strokeStyle = color;
     c.lineWidth = 2;
-    c.strokeRect(p1.x, p1.y, p2.x-p1.x, p2.y-p1.y);
+    c.stroke();
+    // Corner handles
+    for (let j = 0; j < 4; j++) {
+      c.beginPath();
+      c.arc(pts[j].x, pts[j].y, 5, 0, Math.PI*2);
+      c.fillStyle = '#fff';
+      c.fill();
+      c.strokeStyle = color;
+      c.lineWidth = 2;
+      c.stroke();
+    }
+    // Number badge at first point
     c.font = 'bold 14px sans-serif';
     c.fillStyle = color;
-    c.fillRect(p1.x, p1.y-20, 24, 18);
+    c.fillRect(pts[0].x, pts[0].y-20, 24, 18);
     c.fillStyle = '#fff';
-    c.fillText('#'+(i+1), p1.x+4, p1.y-6);
+    c.fillText('#'+(i+1), pts[0].x+4, pts[0].y-6);
   });
 
   // Draw preview
@@ -1709,6 +1794,26 @@ function cToR(cx, cy) {
   return {x: (cx - regionView.x)/s, y: (cy - regionView.y)/s};
 }
 
+function findCornerAt(cx, cy, threshold) {
+  for (let ri = regions.length-1; ri >= 0; ri--) {
+    for (let ci = 0; ci < 4; ci++) {
+      const p = rToC(regions[ri].points[ci].x, regions[ri].points[ci].y);
+      const dx = p.x-cx, dy = p.y-cy;
+      if (dx*dx+dy*dy <= threshold*threshold) return {regionIdx:ri, cornerIdx:ci};
+    }
+  }
+  return null;
+}
+
+function pointInQuad(px, py, pts) {
+  let inside = false;
+  for (let i = 0, j = 3; i < 4; j = i++) {
+    const xi=pts[i].x, yi=pts[i].y, xj=pts[j].x, yj=pts[j].y;
+    if (((yi>py)!==(yj>py)) && (px<(xj-xi)*(py-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+
 // Modal mouse events
 document.getElementById('modalCanvas').addEventListener('mousedown', e => {
   if (!regionImg) return;
@@ -1716,15 +1821,14 @@ document.getElementById('modalCanvas').addEventListener('mousedown', e => {
   const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
 
   if (e.button === 1 || (e.button === 0 && regionSpace)) {
-    regionDrag = {mode:'pan', start:{x:cx, y:cy}, ox:regionView.x, oy:regionView.y};
+    regionDrag = {mode:'pan', start:{x:cx, y:cy}, ox:regionView.x, oy:regionView.y, regionIdx:-1, cornerIdx:-1};
     regionCanvas.style.cursor = 'grabbing';
     return;
   }
   if (e.button === 2) {
     const orig = cToR(cx, cy);
     for (let i = regions.length-1; i >= 0; i--) {
-      const r = regions[i];
-      if (orig.x >= r.x1 && orig.x <= r.x2 && orig.y >= r.y1 && orig.y <= r.y2) {
+      if (pointInQuad(orig.x, orig.y, regions[i].points)) {
         regions.splice(i, 1);
         redrawRegion();
         return;
@@ -1732,7 +1836,14 @@ document.getElementById('modalCanvas').addEventListener('mousedown', e => {
     }
     return;
   }
-  regionDrag = {mode:'draw', start:{x:cx, y:cy}, current:{x:cx, y:cy}};
+  // Left click: check corner first, then draw
+  const hit = findCornerAt(cx, cy, 8);
+  if (hit) {
+    regionDrag = {mode:'corner', regionIdx:hit.regionIdx, cornerIdx:hit.cornerIdx, start:{x:cx, y:cy}};
+    regionCanvas.style.cursor = 'move';
+  } else {
+    regionDrag = {mode:'draw', start:{x:cx, y:cy}, current:{x:cx, y:cy}, regionIdx:-1, cornerIdx:-1};
+  }
 });
 
 document.getElementById('modalCanvas').addEventListener('mousemove', e => {
@@ -1742,9 +1853,20 @@ document.getElementById('modalCanvas').addEventListener('mousemove', e => {
     regionView.x = regionDrag.ox + (cx - regionDrag.start.x);
     regionView.y = regionDrag.oy + (cy - regionDrag.start.y);
     redrawRegion();
+  } else if (regionDrag.mode === 'corner') {
+    const orig = cToR(cx, cy);
+    regions[regionDrag.regionIdx].points[regionDrag.cornerIdx] = {
+      x: Math.max(0, Math.min(orig.x, regionImg.naturalWidth)),
+      y: Math.max(0, Math.min(orig.y, regionImg.naturalHeight))
+    };
+    redrawRegion();
   } else if (regionDrag.mode === 'draw') {
     regionDrag.current = {x:cx, y:cy};
     redrawRegion();
+  } else {
+    // Idle: update cursor based on corner proximity
+    const hit = findCornerAt(cx, cy, 8);
+    regionCanvas.style.cursor = hit ? 'move' : 'crosshair';
   }
 });
 
@@ -1754,10 +1876,15 @@ document.getElementById('modalCanvas').addEventListener('mouseup', e => {
     const o2 = cToR(Math.max(regionDrag.start.x, regionDrag.current.x), Math.max(regionDrag.start.y, regionDrag.current.y));
     const rw = o2.x - o1.x, rh = o2.y - o1.y;
     if (rw > 5 && rh > 5) {
-      regions.push({x1:Math.max(0,o1.x), y1:Math.max(0,o1.y), x2:Math.min(regionImg.naturalWidth,o2.x), y2:Math.min(regionImg.naturalHeight,o2.y)});
+      regions.push({points:[
+        {x:Math.max(0,o1.x), y:Math.max(0,o1.y)},
+        {x:Math.min(regionImg.naturalWidth,o2.x), y:Math.max(0,o1.y)},
+        {x:Math.min(regionImg.naturalWidth,o2.x), y:Math.min(regionImg.naturalHeight,o2.y)},
+        {x:Math.max(0,o1.x), y:Math.min(regionImg.naturalHeight,o2.y)}
+      ]});
     }
   }
-  regionDrag = {mode:'none'};
+  regionDrag = {mode:'none', regionIdx:-1, cornerIdx:-1};
   redrawRegion();
 });
 
@@ -1801,33 +1928,21 @@ async function confirmRegionOCR() {
   render();
 
   let allText = '';
-  for (let ri = 0; ri < savedRegions.length; ri++) {
-    if (savedItem && savedItem.aborted) break;
-    const r = savedRegions[ri];
-    const sw = Math.round(r.x2 - r.x1), sh = Math.round(r.y2 - r.y1);
-    if (sw <= 0 || sh <= 0) continue;
-    const tmpC = document.createElement('canvas');
-    tmpC.width = sw; tmpC.height = sh;
-    tmpC.getContext('2d').drawImage(savedImg, r.x1, r.y1, sw, sh, 0, 0, sw, sh);
-    const b64 = tmpC.toDataURL('image/png');
-    try {
-      const result = await api('/api/ocr/' + savedImgId, {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({image_base64: b64, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()})
-      });
-      if (savedItem && savedItem.aborted) break;
-      if (result && !result.error && result.text) {
-        if (allText) allText += '\n\n';
-        allText += result.text;
-      }
-    } catch(e) { if (savedItem && savedItem.aborted) break; }
-  }
+  try {
+    const payload = {image_base64: savedItem.data, regions: savedRegions, mode: ocrMode, recog_type: recogType, ...getAIConfigPayload()};
+    const result = await api('/api/ocr/region', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (savedItem && savedItem.aborted) { savedItem.status = 'ready'; }
+    else if (result && !result.error && result.text) {
+      savedItem.text = result.text;
+      savedItem.status = 'done';
+      saveText(savedImgId, result.text);
+    }
+  } catch(e) {}
 
-  if (savedItem && !savedItem.aborted) {
-    savedItem.text = allText;
-    savedItem.status = 'done';
-  }
   if (savedItem) delete savedItem.aborted;
 
   render();
@@ -1847,6 +1962,18 @@ let structConfig = {
   api_key: localStorage.getItem('structApiKey') || '',
   model: localStorage.getItem('structModel') || 'claude-sonnet-4-20250514'
 };
+
+// Per-model key storage
+function getPerModelKey(modelName) {
+  const keys = JSON.parse(localStorage.getItem('perModelKeys') || '{}');
+  return keys[modelName] || '';
+}
+function setPerModelKey(modelName, apiKey, apiUrl) {
+  const keys = JSON.parse(localStorage.getItem('perModelKeys') || '{}');
+  if (apiKey) keys[modelName] = {key: apiKey, url: apiUrl};
+  else delete keys[modelName];
+  localStorage.setItem('perModelKeys', JSON.stringify(keys));
+}
 
 // Load persistent config from server
 async function loadServerConfig() {
@@ -1882,7 +2009,8 @@ const structPresets = [
 function openConfigModal() {
   document.getElementById('cfgUrl').value = aiConfig.api_url;
   document.getElementById('cfgModel').value = aiConfig.model;
-  document.getElementById('cfgKey').value = aiConfig.api_key;
+  const saved = getPerModelKey(aiConfig.model);
+  document.getElementById('cfgKey').value = saved.key || aiConfig.api_key;
   document.getElementById('cfgStructUrl').value = structConfig.api_url;
   document.getElementById('cfgStructKey').value = structConfig.api_key;
   document.getElementById('cfgStructModel').value = structConfig.model;
@@ -1898,12 +2026,28 @@ function closeConfigModal() {
 function selectPreset(p) {
   document.getElementById('cfgUrl').value = p.url;
   document.getElementById('cfgModel').value = p.name;
+  const saved = getPerModelKey(p.name);
+  if (saved) {
+    document.getElementById('cfgKey').value = saved.key;
+    if (saved.url) document.getElementById('cfgUrl').value = saved.url;
+    aiConfig.api_key = saved.key;
+    aiConfig.api_url = saved.url;
+  }
+  aiConfig.model = p.name;
   renderPresets();
 }
 
 function selectStructPreset(p) {
   document.getElementById('cfgStructUrl').value = p.url;
   document.getElementById('cfgStructModel').value = p.name;
+  const saved = getPerModelKey(p.name);
+  if (saved) {
+    document.getElementById('cfgStructKey').value = saved.key;
+    if (saved.url) document.getElementById('cfgStructUrl').value = saved.url;
+    structConfig.api_key = saved.key;
+    structConfig.api_url = saved.url;
+  }
+  structConfig.model = p.name;
   renderStructPresets();
 }
 
@@ -1930,6 +2074,9 @@ function saveConfig() {
   structConfig.api_url = document.getElementById('cfgStructUrl').value.trim();
   structConfig.api_key = document.getElementById('cfgStructKey').value.trim();
   structConfig.model = document.getElementById('cfgStructModel').value.trim();
+  // Save per-model key
+  setPerModelKey(aiConfig.model, aiConfig.api_key, aiConfig.api_url);
+  setPerModelKey(structConfig.model, structConfig.api_key, structConfig.api_url);
   localStorage.setItem('aiModel', aiConfig.model);
   localStorage.setItem('aiApiUrl', aiConfig.api_url);
   localStorage.setItem('aiApiKey', aiConfig.api_key);
@@ -2012,8 +2159,10 @@ func main() {
 			handleDeleteImage(w, r)
 		}
 	})
+	http.HandleFunc("/api/ocr/region", handleOCRRegion)
 	http.HandleFunc("/api/ocr/", handleOCR)
 	http.HandleFunc("/api/text/", handleSaveText)
+	http.HandleFunc("/api/regions/", handleSaveRegions)
 	http.HandleFunc("/api/table_text/", handleSaveTableText)
 	http.HandleFunc("/api/export", handleExport)
 	http.HandleFunc("/api/export/xlsx", handleExportXlsx)

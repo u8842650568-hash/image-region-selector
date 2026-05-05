@@ -86,6 +86,57 @@ def _preprocess(img_bytes):
         return img_bytes
 
 
+def _warp_region(img_bytes, points, max_dim=2000):
+    """Perspective-correct a quadrilateral region from the image.
+    points: list of 4 dicts [{x,y}, ...] in TL, TR, BR, BL order (image pixel coords).
+    Returns JPEG bytes of the warped region, or None on failure.
+    """
+    import cv2
+    import numpy as np
+
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+
+    try:
+        src_pts = np.array([
+            [min(max(p['x'], 0), w - 1), min(max(p['y'], 0), h - 1)]
+            for p in points
+        ], dtype=np.float32)
+
+        # Output dimensions from edge lengths
+        width_top = np.linalg.norm(src_pts[1] - src_pts[0])
+        width_bottom = np.linalg.norm(src_pts[2] - src_pts[3])
+        max_w = max(int(width_top), int(width_bottom))
+
+        height_left = np.linalg.norm(src_pts[3] - src_pts[0])
+        height_right = np.linalg.norm(src_pts[2] - src_pts[1])
+        max_h = max(int(height_left), int(height_right))
+
+        if max_w < 10 or max_h < 10:
+            return None
+
+        # Downscale if too large
+        if max(max_w, max_h) > max_dim:
+            scale = max_dim / max(max_w, max_h)
+            max_w = int(max_w * scale)
+            max_h = int(max_h * scale)
+
+        dst_pts = np.array([
+            [0, 0], [max_w - 1, 0],
+            [max_w - 1, max_h - 1], [0, max_h - 1]
+        ], dtype=np.float32)
+
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        warped = cv2.warpPerspective(img, M, (max_w, max_h), flags=cv2.INTER_LINEAR)
+
+        _, encoded = cv2.imencode('.jpg', warped, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return encoded.tobytes()
+    except Exception:
+        return None
+
+
 def _build_opener():
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({})
@@ -228,36 +279,69 @@ def _merge_sections(all_text, mode="text"):
         curr_lines = section.split('\n')
 
         if mode == "text":
-            # Text mode: find best matching line in curr within prev's tail region
-            # Skip very short lines at start of curr (likely edge fragments)
-            skip_leading = 0
-            for cl in curr_lines:
-                if cl.strip() and len(cl.strip()) < 10:
-                    skip_leading += 1
-                else:
-                    break
-
+            # Text mode: sliding window overlap detection
+            # Compare multi-line windows from curr's head against prev's tail
+            # This handles cases where VLM slightly alters text in overlap regions
             best_ratio = 0
-            best_curr_idx = -1
-            best_prev_idx = -1
-            for ci in range(skip_leading, min(len(curr_lines), skip_leading + 30)):
-                curr_line = curr_lines[ci].strip()
-                if len(curr_line) < 15:
-                    continue
-                for pi in range(max(0, len(prev_lines) - 30), len(prev_lines)):
-                    prev_line = prev_lines[pi].strip()
-                    if len(prev_line) < 15:
-                        continue
-                    ratio = difflib.SequenceMatcher(None, prev_line, curr_line).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_curr_idx = ci
-                        best_prev_idx = pi
+            best_curr_idx = 0
+            search_range = min(40, len(curr_lines))
+            tail_range = min(40, len(prev_lines))
 
-            if best_ratio >= 0.6 and best_curr_idx > 0:
+            # Try windows of size 1 to 5 lines from curr's head
+            for win_size in range(1, min(6, search_range + 1)):
+                for ci in range(0, search_range - win_size + 1):
+                    curr_win = ' '.join(l.strip() for l in curr_lines[ci:ci+win_size] if l.strip())
+                    if len(curr_win) < 20:
+                        continue
+                    # Search in prev's tail for matching window
+                    for pi in range(max(0, len(prev_lines) - tail_range), len(prev_lines) - win_size + 1):
+                        prev_win = ' '.join(l.strip() for l in prev_lines[pi:pi+win_size] if l.strip())
+                        if len(prev_win) < 20:
+                            continue
+                        ratio = difflib.SequenceMatcher(None, prev_win, curr_win).ratio()
+                        # Prefer earlier curr_idx with higher ratio; larger windows get a bonus
+                        adjusted = ratio + (win_size - 1) * 0.05
+                        if adjusted > best_ratio:
+                            best_ratio = adjusted
+                            best_curr_idx = ci
+
+            if best_ratio >= 0.65 and best_curr_idx > 0:
+                # Also skip preceding fragment lines (sentence cut across sections)
+                while best_curr_idx > 0:
+                    prev_line = curr_lines[best_curr_idx - 1].strip()
+                    if prev_line and not re.search(r'[。！？]', prev_line):
+                        best_curr_idx -= 1
+                    else:
+                        break
+                print(f"[Vision] Overlap: window match ratio={best_ratio:.2f}, skip {best_curr_idx}/{len(curr_lines)} lines", file=sys.stderr, flush=True)
                 merged.append('\n'.join(curr_lines[best_curr_idx:]))
             else:
-                merged.append(section)
+                print(f"[Vision] No overlap detected, best_ratio={best_ratio:.2f}, appending full section ({len(curr_lines)} lines)", file=sys.stderr, flush=True)
+                # Fallback: single-line best match (original behavior)
+                skip_leading = 0
+                for cl in curr_lines:
+                    if cl.strip() and len(cl.strip()) < 10:
+                        skip_leading += 1
+                    else:
+                        break
+                found = False
+                for ci in range(skip_leading, min(len(curr_lines), skip_leading + 30)):
+                    curr_line = curr_lines[ci].strip()
+                    if len(curr_line) < 20:
+                        continue
+                    for pi in range(max(0, len(prev_lines) - 30), len(prev_lines)):
+                        prev_line = prev_lines[pi].strip()
+                        if len(prev_line) < 20:
+                            continue
+                        if difflib.SequenceMatcher(None, prev_line, curr_line).ratio() >= 0.8:
+                            if ci > 0:
+                                merged.append('\n'.join(curr_lines[ci:]))
+                                found = True
+                            break
+                    if found:
+                        break
+                if not found:
+                    merged.append(section)
         else:
             # Table mode: exact + fuzzy line-by-line
             best_overlap = 0
@@ -280,7 +364,10 @@ def _merge_sections(all_text, mode="text"):
 
     # Global dedup for text mode: remove repeated question blocks
     if mode == "text":
+        before = result
         result = _dedup_questions(result)
+        if result != before:
+            print(f"[Vision] _dedup_questions: {len(before)} -> {len(result)} chars", file=sys.stderr, flush=True)
         result = _dedup_trailing_text(result)
 
     return result
@@ -313,32 +400,90 @@ def _is_complete_markdown_table(text):
 
 
 def _dedup_questions(text):
-    """Remove duplicate question blocks in text (e.g. '31. C 【解析】' appearing twice)."""
+    """Remove duplicate question blocks, including content-level duplicates
+    where VLM misidentified the question number (e.g. '45' → '5')."""
     lines = text.split('\n')
-    seen_starts = {}  # line content -> first occurrence index
-    deduped = []
-    skip_until_change = False
-
+    # Collect all question blocks: {start_line_idx, number, content_lines}
+    question_blocks = []
+    current_q = None
+    current_lines = []
     for i, line in enumerate(lines):
         stripped = line.strip()
-        # Detect question start pattern: "N. X 【解析】"
-        m = re.match(r'^(\d+)\.\s*[A-Z]\s*【', stripped)
+        m = re.match(r'^(\d+)\.\s*[A-Z]', stripped)
         if m:
-            q_key = m.group(1)
-            if q_key in seen_starts:
-                skip_until_change = True
-                continue
-            seen_starts[q_key] = i
-            skip_until_change = False
+            if current_q is not None:
+                question_blocks.append((current_q, current_lines))
+            current_q = int(m.group(1))
+            current_lines = [line]
+        elif current_q is not None:
+            current_lines.append(line)
+    if current_q is not None:
+        question_blocks.append((current_q, current_lines))
 
-        if skip_until_change:
-            # Keep skipping until we see a new question start
-            if m and m.group(1) not in seen_starts:
-                skip_until_change = False
+    # Build a "content signature" for each block: normalize punctuation then join
+    def normalize(s):
+        return re.sub(r'[\s,，。；;：:！!？?""【】\u3000]+', '', s).lower()
+
+    def block_signature(block_lines):
+        # Use all lines but strip the leading "N. X" prefix from the first line
+        parts = []
+        for idx, l in enumerate(block_lines):
+            s = l.strip()
+            if idx == 0:
+                # Strip "N. X" prefix: "45. A 【解析】..." → "【解析】..."
+                s = re.sub(r'^\d+\.\s*[A-Z]\s*', '', s)
+            if len(s) >= 5:
+                parts.append(s)
+        return normalize(' '.join(parts))
+
+    # Detect duplicates: if two blocks have high content similarity but different numbers,
+    # one is likely a VLM misread. Keep the one with the more plausible number (larger context).
+    remove_nums = set()
+    sigs = [(num, block_signature(bl)) for num, bl in question_blocks]
+    for i in range(len(sigs)):
+        for j in range(i + 1, len(sigs)):
+            num_i, sig_i = sigs[i]
+            num_j, sig_j = sigs[j]
+            if num_i == num_j:
+                # Same number: remove the second occurrence
+                remove_nums.add((j, num_j))
+                continue
+            if not sig_i or not sig_j:
+                continue
+            # Skip comparison if both signatures are too short (would cause false matches)
+            if len(sig_i) < 20 or len(sig_j) < 20:
+                continue
+            # Try full signature comparison (already normalized)
+            ratio = difflib.SequenceMatcher(None, sig_i, sig_j).ratio()
+            # Also check if the shorter signature is a substring of the longer one (truncation)
+            is_substring = (sig_i in sig_j or sig_j in sig_i)
+            if ratio >= 0.55 or is_substring:
+                # Content is nearly identical but numbers differ — VLM misread
+                # Remove the one that appears later (it's the overlap duplicate)
+                remove_nums.add((j, num_j))
+
+    removed_indices = set()
+    for block_idx, num in remove_nums:
+        if block_idx < len(question_blocks):
+            removed_indices.add(block_idx)
+
+    # Build a set of line indices to remove
+    line_indices_to_remove = set()
+    for bi in removed_indices:
+        _, bl = question_blocks[bi]
+        start = lines.index(bl[0])
+        for li in range(start, start + len(bl)):
+            if li < len(lines):
+                line_indices_to_remove.add(li)
+        # Also skip orphan "故选 X。" after the block
+        for li in range(start + len(bl), min(start + len(bl) + 3, len(lines))):
+            s = lines[li].strip()
+            if s == '' or re.match(r'^故选\s*[A-Z]', s):
+                line_indices_to_remove.add(li)
             else:
-                continue
+                break
 
-        deduped.append(line)
+    deduped = [line for i, line in enumerate(lines) if i not in line_indices_to_remove]
 
     return '\n'.join(deduped)
 
@@ -528,8 +673,8 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
         print(f"[Vision-GLM] Decode failed: {e}", file=sys.stderr)
         return None
 
-    MAX_H = 1800
-    OVERLAP = 200
+    MAX_H = 1200
+    OVERLAP = 300
     if h <= MAX_H:
         sections = [img]
     else:
@@ -597,7 +742,7 @@ def vision_ocr_glm(img_bytes, model="glm-4v-flash", api_key=None, api_url=None, 
                     {"type": "text", "text": prompt_text}
                 ]
             }],
-            "max_tokens": 1024,
+            "max_tokens": 4096,
             "temperature": 0
         }
         req = urllib.request.Request(api_url,
@@ -673,8 +818,8 @@ def vision_ocr_minimax(img_bytes, api_key=None, api_host=None, mode="text"):
         print(f"[Vision-MiniMax] Decode failed: {e}", file=sys.stderr)
         return None
 
-    MAX_H = 1800
-    OVERLAP = 200
+    MAX_H = 1200
+    OVERLAP = 300
     if h <= MAX_H:
         sections = [img]
     else:
@@ -774,6 +919,8 @@ class VisionHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/ocr":
             self.handle_ocr()
+        elif self.path == "/ocr/region":
+            self.handle_ocr_region()
         else:
             self.send_error(404)
 
@@ -848,6 +995,87 @@ class VisionHandler(BaseHTTPRequestHandler):
                         mode=ocr_mode)
             if text:
                 self.send_json({"text": text, "status": "done", "strategy": model})
+            else:
+                self.send_json({"text": "(AI识别失败，请检查API配置)", "status": "error", "strategy": model})
+
+        except Exception as e:
+            traceback.print_exc()
+            self.send_json({"error": str(e), "status": "error"}, 500)
+
+    def handle_ocr_region(self):
+        """OCR with perspective-corrected region crops."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+
+            img_b64 = data.get("image_base64", "")
+            if not img_b64:
+                self.send_json({"error": "image_base64 required"}, 400)
+                return
+
+            if "," in img_b64:
+                img_b64 = img_b64.split(",", 1)[1]
+            img_bytes = base64.b64decode(img_b64)
+
+            regions = data.get("regions", [])
+            if not regions:
+                self.send_json({"error": "regions required"}, 400)
+                return
+
+            ai_config = data.get("ai_config", {})
+            model = ai_config.get("model", "glm-4v-flash")
+            recog_type = data.get("recog_type", "text")
+            is_minimax = model and model.startswith("minimax")
+            print(f"[Vision] Region OCR: {len(regions)} region(s), model={model}, recog_type={recog_type}", file=sys.stderr, flush=True)
+
+            all_text_parts = []
+            for ri, region in enumerate(regions):
+                points = region.get("points", [])
+                if len(points) != 4:
+                    print(f"[Vision] Region {ri}: skipping (not 4 points)", file=sys.stderr, flush=True)
+                    continue
+
+                warped_bytes = _warp_region(img_bytes, points)
+                if warped_bytes is None:
+                    print(f"[Vision] Region {ri}: warp failed", file=sys.stderr, flush=True)
+                    continue
+
+                warped_bytes = _preprocess(warped_bytes)
+                ocr_mode = "table_raw" if recog_type == "table" else recog_type
+
+                if is_minimax:
+                    text = vision_ocr_minimax(warped_bytes,
+                        api_key=ai_config.get("api_key") or None,
+                        api_host=ai_config.get("api_url") or None,
+                        mode=ocr_mode)
+                else:
+                    text = vision_ocr_glm(warped_bytes,
+                        model=model,
+                        api_key=ai_config.get("api_key") or None,
+                        api_url=ai_config.get("api_url") or None,
+                        mode=ocr_mode)
+
+                if not text:
+                    print(f"[Vision] Region {ri}: OCR failed", file=sys.stderr, flush=True)
+                    continue
+
+                # Stage 2 structuring for tables
+                if recog_type == "table" and not _is_complete_markdown_table(text):
+                    text = ai_structure_table(text,
+                        api_key=ai_config.get("struct_api_key") or None,
+                        base_url=ai_config.get("struct_api_url") or None,
+                        model=ai_config.get("struct_model") or None)
+                    if text is None:
+                        print(f"[Vision] Region {ri}: structuring failed", file=sys.stderr, flush=True)
+                        continue
+
+                all_text_parts.append(text)
+                print(f"[Vision] Region {ri}: done ({len(text)} chars)", file=sys.stderr, flush=True)
+
+            merged = '\n\n'.join(all_text_parts) if all_text_parts else None
+            if merged:
+                self.send_json({"text": merged, "status": "done", "strategy": model})
             else:
                 self.send_json({"text": "(AI识别失败，请检查API配置)", "status": "error", "strategy": model})
 
