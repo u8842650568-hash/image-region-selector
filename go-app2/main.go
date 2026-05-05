@@ -115,6 +115,10 @@ func dbDelete(id int) {
 	db.Exec("DELETE FROM images WHERE id = ?", id)
 }
 
+func dbDeleteByType(recogType string) {
+	db.Exec("DELETE FROM images WHERE recog_type = ?", recogType)
+}
+
 func dbReorder(items []ImageItem) {
 	for _, item := range items {
 		db.Exec("UPDATE images SET sort_order = ? WHERE id = ?", item.Order, item.ID)
@@ -248,6 +252,18 @@ func handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 	}
 	dbDelete(id)
 	dbReorder(images)
+	jsonOK(w, map[string]string{"ok": "1"})
+}
+
+func handleClearImages(w http.ResponseWriter, r *http.Request) {
+	recogType := r.URL.Query().Get("type")
+	if recogType == "" {
+		recogType = "text"
+	}
+	mu.Lock()
+	images = []ImageItem{}
+	mu.Unlock()
+	dbDeleteByType(recogType)
 	jsonOK(w, map[string]string{"ok": "1"})
 }
 
@@ -703,9 +719,10 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 .empty-hint p{font-size:14px}
 
 /* Region select modal */
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;align-items:center;justify-content:center}
+.modal-overlay{display:none;position:fixed;inset:0;background:#1a1a2e;z-index:1000;align-items:center;justify-content:center}
 .modal-overlay.show{display:flex}
 .modal{background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.15);width:90vw;height:85vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-overlay#regionModal.show .modal{width:100vw;height:100vh;border-radius:0}
 .modal-header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #e8e8e8}
 .modal-header h3{font-size:15px}
 .modal-header .close-btn{width:30px;height:30px;border:none;background:none;font-size:20px;cursor:pointer;border-radius:4px}
@@ -761,7 +778,7 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
 
   <!-- Right content -->
   <div class="content">
-    <div class="content-header" id="contentHeader">上传图片后自动识别文本</div>
+    <div class="content-header" id="contentHeader">上传图片后点击"开始识别"</div>
     <div class="text-list" id="textList">
       <div class="empty-hint" id="emptyHint">
         <div class="icon">&#128196;</div>
@@ -922,8 +939,6 @@ async function handleFiles(e) {
       if (item && item.id) {
         imgItems.push(item);
         render();
-        // Auto OCR after upload
-        autoOCR(item.id, item.data);
       }
     } catch(err) {
       console.error('Upload error:', err);
@@ -990,7 +1005,7 @@ function renderSidebar() {
       + '<button class="del-btn" onclick="event.stopPropagation();deleteImage('+item.id+')">&times;</button>'
       + (getStatus(item) === 'recognizing'
         ? '<button class="ocr-btn" style="bottom:64px;background:rgba(255,0,0,.7)" onclick="event.stopPropagation();stopOCR('+item.id+')">停止</button>'
-        : '<button class="ocr-btn" style="bottom:64px" onclick="event.stopPropagation();reOCR('+item.id+')">重新识别</button>')
+        : '<button class="ocr-btn" style="bottom:64px" onclick="event.stopPropagation();reOCR('+item.id+')">'+(getStatus(item)==='done'?'重新识别':'开始识别')+'</button>')
       + '<button class="ocr-btn" onclick="event.stopPropagation();openRegionModal('+item.id+')">框选识别</button>'
       + '</div></div>';
   });
@@ -1001,7 +1016,7 @@ function renderSidebar() {
 function renderTextList() {
   const list = document.getElementById('textList');
   if (imgItems.length === 0) {
-    list.innerHTML = '<div class="empty-hint"><div class="icon">&#128196;</div><p>上传图片开始识别</p></div>';
+    list.innerHTML = '<div class="empty-hint"><div class="icon">&#128196;</div><p>上传图片后点击"开始识别"</p></div>';
     return;
   }
   const isTable = recogType === 'table';
@@ -1577,7 +1592,8 @@ function exportTxt() {
 // ========== Clear ==========
 async function clearAll() {
   if (imgItems.length === 0) return;
-  if (!confirm('确定清空所有图片和文本？')) return;
+  if (!confirm('确定清空当前模式的所有图片和文本？')) return;
+  await fetch('/api/images/clear?type=' + recogType, {method: 'DELETE'});
   imgItems = [];
   activeImgId = null;
   render();
@@ -1590,6 +1606,10 @@ function openRegionModal(id) {
   if (!item) return;
   const modal = document.getElementById('regionModal');
   modal.classList.add('show');
+  // Reset button state
+  const btn = document.getElementById('btnConfirmRegion');
+  btn.disabled = false;
+  btn.textContent = '识别选定区域';
   regionCanvas = document.getElementById('modalCanvas');
   regionCtx = regionCanvas.getContext('2d');
   // Restore saved regions
@@ -1623,6 +1643,10 @@ function resizeRegionCanvas() {
     const sx = (regionCanvas.width - 20) / regionImg.naturalWidth;
     const sy = (regionCanvas.height - 20) / regionImg.naturalHeight;
     regionView.base = Math.min(sx, sy, 1);
+    // For large images: use height-fit if width-fit would make it too small
+    if (sx < sy && sx < 0.3) {
+      regionView.base = Math.min(sy, 1);
+    }
     regionView.scale = 1;
     regionView.x = (regionCanvas.width - regionImg.naturalWidth * regionView.base) / 2;
     regionView.y = (regionCanvas.height - regionImg.naturalHeight * regionView.base) / 2;
@@ -1743,7 +1767,7 @@ document.getElementById('modalCanvas').addEventListener('wheel', e => {
   const rect = regionCanvas.getBoundingClientRect();
   const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
   const factor = e.deltaY < 0 ? 1.12 : 1/1.12;
-  const ns = Math.max(0.3, Math.min(regionView.scale * factor, 8));
+  const ns = Math.max(0.1, Math.min(regionView.scale * factor, 20));
   regionView.x = cx - (cx - regionView.x) * (ns / regionView.scale);
   regionView.y = cy - (cy - regionView.y) * (ns / regionView.scale);
   regionView.scale = ns;
@@ -1765,8 +1789,6 @@ async function confirmRegionOCR() {
   if (!regionImgId || !regionImg) return;
 
   const btn = document.getElementById('btnConfirmRegion');
-  btn.disabled = true;
-  btn.textContent = '识别中...';
 
   // Save regions, set status, close modal immediately
   const savedRegions = JSON.parse(JSON.stringify(regions));
@@ -1808,8 +1830,6 @@ async function confirmRegionOCR() {
   }
   if (savedItem) delete savedItem.aborted;
 
-  btn.disabled = false;
-  btn.textContent = '识别选定区域';
   render();
 }
 
@@ -1986,6 +2006,7 @@ func main() {
 	http.HandleFunc("/api/upload", handleUpload)
 	http.HandleFunc("/api/images", handleListImages)
 	http.HandleFunc("/api/reorder", handleReorder)
+	http.HandleFunc("/api/images/clear", handleClearImages)
 	http.HandleFunc("/api/images/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			handleDeleteImage(w, r)

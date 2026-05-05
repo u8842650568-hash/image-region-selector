@@ -14,7 +14,76 @@ import traceback
 import re
 import difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def _preprocess(img_bytes):
+    """Preprocess image: deskew + contrast enhance. Returns JPEG bytes."""
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageEnhance, ImageFilter
+
+        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return img_bytes
+        h, w = img.shape[:2]
+
+        # Skip preprocessing for very small images (likely already cropped cleanly)
+        if min(h, w) < 100:
+            return img_bytes
+
+        # 1. Convert to grayscale for skew detection
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 2. Deskew using projection profile (horizontal projection variance)
+        def _deskew_angle(gray_img):
+            thresh = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+            # Try angles from -10 to 10 degrees, pick the one with max projection variance
+            best_angle = 0
+            best_score = -1
+            (h, w) = gray_img.shape
+            test_angles = [a * 0.5 for a in range(-20, 21)]  # -10 to 10, step 0.5
+            for angle in test_angles:
+                M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+                rotated = cv2.warpAffine(thresh, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                # Horizontal projection: sum each row
+                row_sums = rotated.sum(axis=1)
+                # Score: variance of row sums (aligned text has higher variance)
+                score = np.var(row_sums)
+                if score > best_score:
+                    best_score = score
+                    best_angle = angle
+            return best_angle
+
+        angle = _deskew_angle(gray)
+        if abs(angle) > 0.5:
+            (h, w) = img.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            print(f"[Preprocess] Deskewed by {angle:.1f} degrees", file=sys.stderr, flush=True)
+
+        # 3. Convert to PIL for contrast enhancement
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+        # CLAHE-like enhancement via sharpness + contrast
+        enhancer = ImageEnhance.Contrast(pil_img)
+        pil_img = enhancer.enhance(1.2)
+        enhancer = ImageEnhance.Sharpness(pil_img)
+        pil_img = enhancer.enhance(1.3)
+
+        # Encode back
+        import io
+        buf = io.BytesIO()
+        pil_img.save(buf, format='JPEG', quality=85)
+        result = buf.getvalue()
+        print(f"[Preprocess] {len(img_bytes)} -> {len(result)} bytes", file=sys.stderr, flush=True)
+        return result
+    except Exception as e:
+        print(f"[Preprocess] Skipped: {e}", file=sys.stderr, flush=True)
+        return img_bytes
 
 
 def _build_opener():
@@ -91,14 +160,28 @@ def _clean_boundary(text):
     """Clean truncated/fragmented text at section boundaries."""
     lines = text.split('\n')
 
-    # Remove orphan lines at start (< 3 chars)
+    # Remove leading fragments: consecutive short lines (< 30 chars) at the start
     start = 0
+    consecutive_short = 0
     for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped:
             continue
-        if len(stripped) <= 3 and i < len(lines) - 1 and lines[i+1].strip():
-            start = i + 1
+        if len(stripped) < 30:
+            consecutive_short += 1
+        else:
+            if consecutive_short >= 3:
+                start = i  # skip all the short lines before this
+            break
+
+    # Remove trailing fragments: short lines (< 20 chars) after last substantial line
+    end = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        if len(stripped) < 20:
+            end = i
         else:
             break
 
@@ -198,6 +281,7 @@ def _merge_sections(all_text, mode="text"):
     # Global dedup for text mode: remove repeated question blocks
     if mode == "text":
         result = _dedup_questions(result)
+        result = _dedup_trailing_text(result)
 
     return result
 
@@ -257,6 +341,40 @@ def _dedup_questions(text):
         deduped.append(line)
 
     return '\n'.join(deduped)
+
+
+def _dedup_trailing_text(text):
+    """Remove trailing fragment lines: consecutive short lines with [?] marks (VLM truncation)."""
+    lines = text.split('\n')
+    if len(lines) < 10:
+        return text
+
+    # Scan backwards for consecutive short/fragment lines
+    end = len(lines)
+    short_run = 0
+    for i in range(len(lines) - 1, -1, -1):
+        s = lines[i].strip()
+        if not s:
+            continue
+        is_frag = len(s) <= 15 and ('[?]' in s or not re.search(r'[\u4e00-\u9fff]', s))
+        if is_frag:
+            short_run += 1
+        else:
+            break
+
+    if short_run >= 2:
+        i = len(lines) - 1
+        while i >= 0:
+            s = lines[i].strip()
+            if not s:
+                i -= 1; continue
+            is_frag = len(s) <= 15 and ('[?]' in s or not re.search(r'[\u4e00-\u9fff]', s))
+            if is_frag:
+                i -= 1; continue
+            break
+        end = i + 1
+
+    return '\n'.join(lines[:end])
 
 
 def _extract_table(text):
@@ -675,6 +793,9 @@ class VisionHandler(BaseHTTPRequestHandler):
 
             img_bytes = base64.b64decode(img_b64)
 
+            # Image preprocessing
+            img_bytes = _preprocess(img_bytes)
+
             # AI mode
             ai_config = data.get("ai_config", {})
             model = ai_config.get("model", "glm-4v-flash")
@@ -754,7 +875,7 @@ class VisionHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8081
-    server = HTTPServer(("127.0.0.1", port), VisionHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), VisionHandler)
     print(f"Vision service running on http://127.0.0.1:{port}")
     print(f"  POST /ocr     - AI vision recognition")
     print(f"  GET  /health   - health check")
