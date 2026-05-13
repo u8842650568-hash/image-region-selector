@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
@@ -15,8 +20,69 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/xuri/excelize/v2"
+	_ "golang.org/x/image/webp"
 )
 
+
+// ==================== Thumbnail ====================
+
+const thumbMaxSize = 400
+
+func makeThumbnail(data []byte, ct string) string {
+	src, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+	bounds := src.Bounds()
+	w, h := bounds.Dx(), bounds.Dy()
+	if w <= thumbMaxSize && h <= thumbMaxSize {
+		return ""
+	}
+	ratio := float64(thumbMaxSize) / float64(max(w, h))
+	nw := int(float64(w) * ratio)
+	nh := int(float64(h) * ratio)
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	// Bilinear resize
+	for y := 0; y < nh; y++ {
+		fy := float64(y) / ratio
+		y0 := int(fy)
+		y1 := y0 + 1
+		if y1 >= h {
+			y1 = h - 1
+		}
+		fyF := fy - float64(y0)
+		for x := 0; x < nw; x++ {
+			fx := float64(x) / ratio
+			x0 := int(fx)
+			x1 := x0 + 1
+			if x1 >= w {
+				x1 = w - 1
+			}
+			fxF := fx - float64(x0)
+			r00, g00, b00, a00 := src.At(x0, y0).RGBA()
+			r10, g10, b10, a10 := src.At(x1, y0).RGBA()
+			r01, g01, b01, a01 := src.At(x0, y1).RGBA()
+			r11, g11, b11, a11 := src.At(x1, y1).RGBA()
+			interpolate := func(c00, c10, c01, c11 uint32) uint32 {
+				return uint32(float64(c00)*(1-fxF)*(1-fyF) + float64(c10)*fxF*(1-fyF) + float64(c01)*(1-fxF)*fyF + float64(c11)*fxF*fyF)
+			}
+			dst.Set(x, y, color.RGBA64{
+				R: uint16(interpolate(r00, r10, r01, r11)),
+				G: uint16(interpolate(g00, g10, g01, g11)),
+				B: uint16(interpolate(b00, b10, b01, b11)),
+				A: uint16(interpolate(a00, a10, a01, a11)),
+			})
+		}
+	}
+	var buf bytes.Buffer
+	switch ct {
+	case "image/png":
+		png.Encode(&buf, dst)
+	default:
+		jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 80})
+	}
+	return "data:" + ct + ";base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+}
 
 // ==================== Data Model ====================
 
@@ -136,13 +202,18 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	ct := http.DetectContentType(data)
 	dataURL := "data:" + ct + ";base64," + b64
 
+	thumb := makeThumbnail(data, ct)
+	if thumb == "" {
+		thumb = dataURL
+	}
+
 	mu.Lock()
 	nextID++
 	item := ImageItem{
 		ID:        nextID,
 		Name:      header.Filename,
 		Data:      dataURL,
-		Thumb:     dataURL,
+		Thumb:     thumb,
 		Status:    "ready",
 		Order:     len(images),
 	}
@@ -688,6 +759,24 @@ async function api(path, opts={}) {
 }
 
 // ========== Init ==========
+function genThumb(dataURL) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      const maxSz = 400;
+      if (img.width <= maxSz && img.height <= maxSz) { resolve(dataURL); return; }
+      const ratio = Math.min(maxSz/img.width, maxSz/img.height);
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width*ratio);
+      c.height = Math.round(img.height*ratio);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      resolve(c.toDataURL('image/jpeg', 0.8));
+    };
+    img.onerror = () => resolve(dataURL);
+    img.src = dataURL;
+  });
+}
+
 async function loadImages() {
   try {
     const data = await api('/api/images');
@@ -698,6 +787,12 @@ async function loadImages() {
       });
       activeImgId = imgItems.length > 0 ? imgItems[0].id : null;
       render();
+      // Async generate thumbnails for items that use full data as thumb
+      for (const item of imgItems) {
+        if (item.thumb === item.data && item.data.length > 50000) {
+          genThumb(item.data).then(thumb => { item.thumb = thumb; renderSidebar(); });
+        }
+      }
     }
   } catch(e) {}
 }
@@ -709,7 +804,7 @@ function addImages() {
 }
 
 async function handleFiles(e) {
-  const files = e.target.files;
+  const files = Array.from(e.target.files);
   if (!files.length) return;
   e.target.value = '';
 
@@ -717,7 +812,6 @@ async function handleFiles(e) {
     const fd = new FormData();
     fd.append('image', file);
     try {
-      // No recog_type needed
       const item = await api('/api/upload', {method:'POST', body:fd});
       if (item && item.id) {
         imgItems.push(item);
@@ -781,7 +875,7 @@ function renderSidebar() {
       + '<div class="drag-handle" onpointerdown="onPointerDown(event)">'
       + '<svg viewBox="0 0 10 20" width="10" height="20"><circle cx="3" cy="4" r="1.5" fill="#bbb"/><circle cx="3" cy="10" r="1.5" fill="#bbb"/><circle cx="3" cy="16" r="1.5" fill="#bbb"/><circle cx="7" cy="4" r="1.5" fill="#bbb"/><circle cx="7" cy="10" r="1.5" fill="#bbb"/><circle cx="7" cy="16" r="1.5" fill="#bbb"/></svg>'
       + '</div>'
-      + '<div class="card-body"><div class="thumb-wrap" style="position:relative"><img class="thumb" src="'+item.data+'" alt="'+item.name+'">'
+      + '<div class="card-body"><div class="thumb-wrap" style="position:relative"><img class="thumb" src="'+item.thumb+'" alt="'+item.name+'">'
       + '<span class="order-badge">'+(idx+1)+'</span></div>'
       + '<div class="info"><span class="name">'+shortName+'</span>'
       + '<span class="status-dot '+dotCls+'"></span></div>'
