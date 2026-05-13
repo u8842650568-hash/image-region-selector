@@ -638,7 +638,7 @@ body{font-family:"WenQuanYi Micro Hei","Noto Sans CJK SC","Microsoft YaHei",sans
     </div>
     <div class="config-form">
       <label>API 地址</label>
-      <input type="text" id="cfgUrl" placeholder="https://open.bigmodel.cn/api/paas/v4/chat/completions">
+      <input type="text" id="cfgUrl" placeholder="https://open.bigmodel.cn/api/coding/paas/v4/chat/completions">
       <div class="hint">AI 识别 API 地址（MiniMax VLM 仅需填写 API Host）</div>
 
       <label>模型名称</label>
@@ -1540,7 +1540,7 @@ new ResizeObserver(() => { if (regionImg) resizeRegionCanvas(); }).observe(docum
 // ========== Config Modal ==========
 let aiConfig = {
   model: localStorage.getItem('aiModel') || 'glm-4v-flash',
-  api_url: localStorage.getItem('aiApiUrl') || 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+  api_url: localStorage.getItem('aiApiUrl') || 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions',
   api_key: localStorage.getItem('aiApiKey') || ''
 };
 
@@ -1568,8 +1568,8 @@ async function loadServerConfig() {
 loadServerConfig();
 
 const presets = [
-  {name:'glm-4v-flash',   label:'GLM-4V Flash (免费)', url:'https://open.bigmodel.cn/api/paas/v4/chat/completions'},
-
+  {name:'glm-4v-flash',   label:'GLM-4V Flash (免费)', url:'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions'},
+  {name:'glm-4.6v',       label:'GLM-4.6V (智谱专业OCR)', url:'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions'},
   {name:'minimax-vlm',    label:'MiniMax VLM (Token Plan)', url:'https://api.minimaxi.com'},
 ];
 

@@ -1,8 +1,22 @@
 # Binaries
-*.db
 go-app2/app
 go-app2/go-app2
 *.exe
+
+# Database
+*.db
+
+# Environment
+.env
+nohup.out
+
+# Config (contains API keys)
+config.json
+
+# Temp/debug
+debug/
+/tmp/
+*.dat
 
 # Python
 __pycache__/
@@ -10,19 +24,12 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-# Environment
-.env
-nohup.out
-
-# Temp/debug
-debug/
-/tmp/
-*.dat
-
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 .DS_Store
-config.json
+
+# OS
+Thumbs.db

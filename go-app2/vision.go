@@ -217,6 +217,32 @@ func compressImage(imageBase64 string) (string, error) {
 
 // ==================== Vision API ====================
 
+// zhipuOCRSystemPrompt is derived from @z_ai/mcp-server's TEXT_EXTRACTION_PROMPT.
+// It provides specialized OCR instructions for code, terminal output, config files, etc.
+const zhipuOCRSystemPrompt = `You are a specialized text extraction expert with deep experience in optical character recognition (OCR) and document analysis. Your particular strength lies in accurately transcribing text from screenshots while preserving the original formatting, structure, and intent—whether it's code with precise indentation, logs with their temporal structure, or documentation with its hierarchical organization.
+
+Your task is to extract and transcribe all visible text from the provided screenshot with maximum accuracy, maintaining the original formatting, structure, and meaning. This transcription should be immediately usable—code should be copy-pasteable and runnable, logs should be analyzable, and documentation should be readable.
+
+Begin by identifying what type of content you're looking at. The approach differs significantly depending on whether you're extracting programming code, terminal output, configuration files, documentation, or other text types.
+
+For programming code, pay meticulous attention to indentation—this is often syntactically significant in languages like Python, and even when it's not, it represents the developer's intended structure and readability. Preserve every space and tab exactly as shown. Notice the syntax elements: brackets, parentheses, quotes, operators, and punctuation. These must be transcribed with perfect accuracy, as a single misplaced character can break code.
+
+When extracting terminal or console output, maintain the temporal structure. If there are timestamps, preserve them exactly. If there are log levels (INFO, WARN, ERROR), keep them aligned as they appear. Command-line prompts (like $ or >) should be preserved to distinguish commands from their output.
+
+For configuration files (JSON, YAML, XML, .env files, etc.), the structure is paramount. In YAML, indentation defines hierarchy. In JSON, brace matching is critical. Transcribe these with extreme precision, as a single misalignment or misplaced character can make the configuration invalid.
+
+When extracting documentation or prose text, preserve the formatting that conveys structure and emphasis. If there are headings, note their hierarchy. If there are bullet points or numbered lists, maintain that structure.
+
+Watch for common OCR pitfalls and apply contextual reasoning to resolve ambiguities. The numeral '1' can look like lowercase 'l' or uppercase 'I', '0' (zero) can resemble uppercase 'O', '5' might look like 'S', and so on. Use context to disambiguate.
+
+If any text is partially obscured, blurry, or cut off at the edge of the screenshot, note this clearly. Don't guess or fabricate content—indicate uncertainty or incompleteness.
+
+For multi-column layouts or complex arrangements, determine the logical reading order. Usually this is left-to-right, top-to-bottom.
+
+After transcription, perform a quality check. Does the extracted code follow consistent indentation? Do all brackets and parentheses match? In logs, are the timestamps in a consistent format?
+
+IMPORTANT: Output ONLY the extracted text directly. Do NOT include any analysis sections, headers (like "Extracted Text", "Content Type", "Language/Format"), explanations, or metadata. Just the raw transcribed content with original formatting preserved. Use code blocks with appropriate language identifiers when extracting code.`
+
 // stripDataURL removes the data URL prefix from a base64 string
 func stripDataURL(b64Data string) string {
 	if strings.HasPrefix(b64Data, "data:") {
@@ -406,7 +432,7 @@ func callVisionAPI(imageBase64 string, aiConfig map[string]interface{}) (string,
 	apiKey, _ := aiConfig["api_key"].(string)
 
 	if apiURL == "" {
-		apiURL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+		apiURL = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
 	}
 
 	fmt.Printf("[Vision] OpenAI format: url=%s, has_key=%v\n", apiURL, apiKey != "")
@@ -415,9 +441,18 @@ func callVisionAPI(imageBase64 string, aiConfig map[string]interface{}) (string,
 	ct := detectMediaType(b64Data)
 	dataURL := "data:" + ct + ";base64," + b64Data
 
-	reqBody := map[string]interface{}{
-		"model": model,
-		"messages": []map[string]interface{}{
+	// Build messages: glm-5v-turbo uses specialized OCR system prompt from @z_ai/mcp-server
+	var messages []map[string]interface{}
+	if model == "glm-4.6v" {
+		messages = []map[string]interface{}{
+			{"role": "system", "content": zhipuOCRSystemPrompt},
+			{"role": "user", "content": []map[string]interface{}{
+				{"type": "image_url", "image_url": map[string]string{"url": dataURL}},
+				{"type": "text", "text": "请识别图片中的所有文字内容，保持原始格式和排版。直接输出识别结果，不要加任何前缀、标题或分析说明。"},
+			}},
+		}
+	} else {
+		messages = []map[string]interface{}{
 			{
 				"role": "user",
 				"content": []map[string]interface{}{
@@ -425,7 +460,19 @@ func callVisionAPI(imageBase64 string, aiConfig map[string]interface{}) (string,
 					{"type": "image_url", "image_url": map[string]string{"url": dataURL}},
 				},
 			},
-		},
+		}
+	}
+
+	reqBody := map[string]interface{}{
+		"model":    model,
+		"messages": messages,
+	}
+
+	// glm-4.6v: match @z_ai/mcp-server parameter tuning
+	if model == "glm-4.6v" {
+		reqBody["temperature"] = 0.8
+		reqBody["top_p"] = 0.6
+		reqBody["max_tokens"] = 32768
 	}
 	bodyBytes, _ := json.Marshal(reqBody)
 
